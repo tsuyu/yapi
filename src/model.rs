@@ -631,6 +631,38 @@ impl Default for ChainStep {
     }
 }
 
+/// Connection-level options, the ones curl carries as flags.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transport {
+    /// `-L` - follow redirects, up to `max_redirects`.
+    pub follow_redirects: bool,
+    pub max_redirects: usize,
+    /// `--compressed` - ask for gzip/br/deflate and decode it.
+    pub compressed: bool,
+    /// `-x` - proxy url, empty for the system default.
+    pub proxy: String,
+    /// `--cacert` - extra root certificate (PEM).
+    pub ca_cert: String,
+    /// `--cert` / `--key` - client certificate and key (PEM).
+    pub client_cert: String,
+    pub client_key: String,
+}
+
+impl Default for Transport {
+    fn default() -> Self {
+        Self {
+            follow_redirects: true,
+            max_redirects: 10,
+            compressed: true,
+            proxy: String::new(),
+            ca_cert: String::new(),
+            client_cert: String::new(),
+            client_key: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestSpec {
@@ -651,6 +683,7 @@ pub struct RequestSpec {
     pub auth: Auth,
     /// Values pulled out of this request's response, for later requests.
     pub extract: Vec<Extract>,
+    pub transport: Transport,
 }
 
 impl Default for RequestSpec {
@@ -670,6 +703,7 @@ impl Default for RequestSpec {
             binary_content_type: String::new(),
             auth: Auth::default(),
             extract: vec![Extract::default()],
+            transport: Transport::default(),
         }
     }
 }
@@ -748,6 +782,10 @@ impl RequestSpec {
             binary_content_type: self.binary_content_type.clone(),
             auth,
             extract: self.extract.clone(),
+            transport: Transport {
+                proxy: sub(&self.transport.proxy),
+                ..self.transport.clone()
+            },
         }
     }
 

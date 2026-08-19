@@ -162,7 +162,7 @@ fn run(spec: RequestSpec, opts: SendOpts) -> Result<ResponseData, String> {
     if url.is_empty() {
         return Err("url is empty".to_owned());
     }
-    let client = client(opts, &url)?;
+    let client = client_with(opts, &url, &spec.transport)?;
 
     let method = reqwest::Method::from_bytes(spec.method.as_str().as_bytes())
         .map_err(|e| format!("bad method: {e}"))?;
@@ -278,13 +278,64 @@ fn run(spec: RequestSpec, opts: SendOpts) -> Result<ResponseData, String> {
 /// A client configured for one target: proxies bypassed for loopback, and cert
 /// checks optionally skipped.
 pub fn client(opts: SendOpts, url: &str) -> Result<reqwest::blocking::Client, String> {
+    client_with(opts, url, &crate::model::Transport::default())
+}
+
+/// The same, plus the per-request transport options (redirects, proxy, certs).
+pub fn client_with(
+    opts: SendOpts,
+    url: &str,
+    transport: &crate::model::Transport,
+) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(opts.timeout_secs.max(1)))
         .user_agent("api-req/0.1");
-    if is_loopback(url) {
+
+    builder = builder.redirect(if transport.follow_redirects {
+        reqwest::redirect::Policy::limited(transport.max_redirects)
+    } else {
+        reqwest::redirect::Policy::none()
+    });
+
+    if !transport.compressed {
+        builder = builder.no_gzip().no_brotli().no_deflate();
+    }
+
+    let proxy = transport.proxy.trim();
+    if !proxy.is_empty() {
+        builder = builder.proxy(
+            reqwest::Proxy::all(crate::model::normalize_url(proxy))
+                .map_err(|e| format!("bad proxy {proxy:?}: {e}"))?,
+        );
+    } else if is_loopback(url) {
         // a system/corporate proxy must never swallow a request to this machine
         builder = builder.no_proxy();
     }
+
+    let ca = transport.ca_cert.trim();
+    if !ca.is_empty() {
+        let pem = std::fs::read(ca).map_err(|e| format!("{ca}: {e}"))?;
+        for cert in reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| format!("{ca}: {e}"))?
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    let cert = transport.client_cert.trim();
+    if !cert.is_empty() {
+        // rustls wants the key and the certificate in one pem blob
+        let mut pem = std::fs::read(cert).map_err(|e| format!("{cert}: {e}"))?;
+        let key = transport.client_key.trim();
+        if !key.is_empty() {
+            pem.push(b'\n');
+            pem.extend(std::fs::read(key).map_err(|e| format!("{key}: {e}"))?);
+        }
+        builder = builder.identity(
+            reqwest::Identity::from_pem(&pem).map_err(|e| format!("{cert}: {e}"))?,
+        );
+    }
+
     if opts.insecure_tls {
         builder = builder.danger_accept_invalid_certs(true);
     }

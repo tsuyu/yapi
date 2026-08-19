@@ -82,6 +82,50 @@ are sending, it is not a validator.
 
 The top bar warns before you send with a missing or expired credential.
 
+## cURL
+
+cURL is parsed into and written out of the same `RequestSpec` everything else
+uses — nothing shells out to curl, and the import lands in the normal editor
+tabs where you can change it.
+
+**Import** — `import curl` in the top bar opens a paste box. Line
+continuations (`\`, and `^` for cmd), single and double quotes, and
+`--flag=value` all parse.
+
+| curl | becomes |
+|---|---|
+| `-X`, `--request`, `-I`, `-T` | method |
+| bare url, `--url` | url; an existing `?a=b` splits into the query table |
+| `-H`, `--header` | headers; `Cookie:` goes to the cookies table |
+| `-b`, `--cookie` | cookies table |
+| `-d`, `--data`, `--data-raw`, `--data-ascii`, `--json` | body, kind guessed from the content type |
+| `--data-urlencode` | urlencoded body, or query params with `-G` |
+| `--data-binary @file`, `-T file` | binary body |
+| `-F`, `--form` | form-data parts, including `@file` and `;type=` |
+| `-u`, `--oauth2-bearer`, `Authorization:` | the auth tab: basic or bearer |
+| `-L`, `--max-redirs`, `--compressed`, `-x`, `--cacert`, `-E`, `--key` | the options tab |
+| `-k`, `-m` | the top bar (they are app-wide here), reported on import |
+| `-o`, `-w`, `-c`, `--retry`, `-s`, `-v` … | ignored, and listed in the toast |
+
+`-d @file` reads the file the way curl does; `--data-raw @file` does not. An
+`Authorization: Bearer …` header becomes a bearer credential rather than a
+header row, and `Basic` is decoded back into username and password.
+
+**Export** — `copy as curl` puts the command on the clipboard; `show curl` keeps
+a live window open while you edit. `{{variables}}` stay visible by default;
+tick `substitute {{variables}}` to bake in current values. Values are
+single-quoted the way curl's own copy-as does it, so `it's` survives.
+
+Generated commands parse back into the same request — there is a test for that.
+
+## Options tab
+
+Per-request connection settings, saved with the request and carried in curl both
+ways: follow redirects (`-L`) with a maximum, compression (`--compressed`),
+proxy (`-x`), extra root certificate (`--cacert`), and client certificate and
+key (`-E` / `--key`). Timeout and `insecure tls` stay in the top bar because
+they apply to every request.
+
 ## Variables and chaining
 
 Any string in a request — url, query, path params, headers, cookies, body, form
@@ -219,6 +263,7 @@ Secrets are masked in the UI until you tick `reveal`.
 - [src/jwt.rs](src/jwt.rs) — jwt decode and HS256 signing
 - [src/pretty.rs](src/pretty.rs) — xml/html formatting, tag stripping, hex dump
 - [src/jsonpath.rs](src/jsonpath.rs) — jsonpath parser and evaluator
+- [src/curl.rs](src/curl.rs) — curl import and export over the same model
 - [src/extract.rs](src/extract.rs) — response-to-variable extraction rules
 - [src/chain.rs](src/chain.rs) — sequential chain runner
 - [src/store.rs](src/store.rs) — collection and session persistence
@@ -230,12 +275,21 @@ Secrets are masked in the UI until you tick `reveal`.
 cargo test
 ```
 
-75 tests. The network ones stand up a real HTTP server on a loopback port and
+91 tests. The network ones stand up a real HTTP server on a loopback port and
 assert on the bytes it receives: path substitution, cookie header, multipart
 boundaries and file parts, binary bodies, content-type precedence, and an oauth2
 token endpoint exchange; responses are round-tripped to check shape detection,
 xml indenting, image bytes surviving intact, and json key order. A three-step
 chain (login, /users/me, /users/{{user_id}}) is run against a scripted server
 that checks the token reached the second request's header and the id reached the
-third one's url. JWT signing is
-checked against the jwt.io reference token and PKCE against RFC 7636 appendix B.
+third one's url. cURL has 16 of its own, including a generate-then-parse round
+trip and the shell tokenizer's quoting rules. JWT signing is checked against the
+jwt.io reference token and PKCE against RFC 7636 appendix B.
+
+For testing by hand there is a throwaway API covering every feature:
+
+```
+python dev-server.py     # http://localhost:8000
+```
+
+See [TESTING.md](TESTING.md) for a walkthrough.

@@ -2,6 +2,7 @@
 
 mod app;
 mod chain;
+mod curl;
 mod extract;
 mod jsonpath;
 mod jwt;

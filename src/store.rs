@@ -117,6 +117,15 @@ mod tests {
                 from: crate::model::ExtractFrom::JsonPath,
                 expr: "$.access_token".into(),
             }],
+            transport: crate::model::Transport {
+                follow_redirects: false,
+                max_redirects: 3,
+                compressed: false,
+                proxy: "http://proxy:8080".into(),
+                ca_cert: "/etc/ca.pem".into(),
+                client_cert: String::new(),
+                client_key: String::new(),
+            },
         }
     }
 

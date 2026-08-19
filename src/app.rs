@@ -23,6 +23,7 @@ enum Tab {
     Auth,
     Body,
     Extract,
+    Options,
 }
 
 /// The sidebar shows requests or chains; the centre follows.
@@ -127,6 +128,12 @@ pub struct ApiReqApp {
     chain_running: bool,
     chain_log: Vec<ChainLog>,
     new_var: String,
+    curl_window: bool,
+    curl_import_window: bool,
+    curl_import_text: String,
+    curl_import_error: String,
+    /// Substitute `{{vars}}` when writing curl out.
+    curl_resolve_vars: bool,
     oauth_status: String,
     oauth_raw: Option<String>,
     jwt_error: String,
@@ -188,6 +195,11 @@ impl ApiReqApp {
             chain_running: false,
             chain_log: Vec::new(),
             new_var: String::new(),
+            curl_window: false,
+            curl_import_window: false,
+            curl_import_text: String::new(),
+            curl_import_error: String::new(),
+            curl_resolve_vars: false,
             oauth_status: String::new(),
             oauth_raw: None,
             jwt_error: String::new(),
@@ -248,6 +260,151 @@ impl ApiReqApp {
         }
     }
 
+    /// This request as a curl command line.
+    fn as_curl(&self) -> String {
+        let spec = if self.curl_resolve_vars {
+            self.cur.resolve(&self.vars)
+        } else {
+            self.cur.clone()
+        };
+        crate::curl::generate(&spec, self.insecure_tls, Some(self.timeout_secs))
+    }
+
+    fn curl_windows(&mut self, ctx: &egui::Context) {
+        let mut open = self.curl_window;
+        egui::Window::new("curl")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(640.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.curl_resolve_vars, "substitute {{variables}}");
+                    if ui.button("copy").clicked() {
+                        let command = self.as_curl();
+                        ui.ctx().copy_text(command);
+                        self.toast = "copied as curl".to_owned();
+                    }
+                });
+                ui.separator();
+                let command = self.as_curl();
+                let mut text = command.as_str();
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            });
+        self.curl_window = open;
+
+        let mut import_open = self.curl_import_window;
+        let mut do_import = false;
+        let mut do_import_send = false;
+        egui::Window::new("import curl")
+            .open(&mut import_open)
+            .resizable(true)
+            .default_width(640.0)
+            .show(ctx, |ui| {
+                // catch a paste even when the box is not focused, so the window
+                // fills in however the user pastes
+                let pasted: Option<String> = ui.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        egui::Event::Paste(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                });
+                if let Some(text) = pasted {
+                    if !self.curl_import_text.contains(text.trim()) {
+                        self.curl_import_text = text;
+                    }
+                }
+
+                ui.weak("paste a curl command (ctrl+v), then import - line continuations and quotes are fine");
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.curl_import_text)
+                                .code_editor()
+                                .desired_rows(8)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("curl -X POST https://api.example.com/users -H ..."),
+                        );
+                    });
+                ui.horizontal(|ui| {
+                    let has_text = !self.curl_import_text.trim().is_empty();
+                    if ui
+                        .add_enabled(has_text, egui::Button::new("import"))
+                        .on_hover_text("load it into the editor to review before sending")
+                        .clicked()
+                    {
+                        do_import = true;
+                    }
+                    if ui
+                        .add_enabled(has_text, egui::Button::new("import & send"))
+                        .clicked()
+                    {
+                        do_import_send = true;
+                    }
+                    if ui.button("clear").clicked() {
+                        self.curl_import_text.clear();
+                        self.curl_import_error.clear();
+                    }
+                });
+                if !self.curl_import_error.is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(0xef, 0x53, 0x50),
+                        self.curl_import_error.clone(),
+                    );
+                }
+            });
+        self.curl_import_window = import_open;
+
+        if do_import || do_import_send {
+            let ok = self.import_curl();
+            if ok && do_import_send {
+                self.send(ctx);
+            }
+        }
+    }
+
+    /// Returns whether the import succeeded.
+    fn import_curl(&mut self) -> bool {
+        match crate::curl::parse_full(&self.curl_import_text) {
+            Ok(imported) => {
+                self.cur = imported.spec;
+                self.selected = None;
+                self.resp = None;
+                self.error = None;
+                self.mode = Mode::Request;
+                self.tab = Tab::Params;
+                if imported.insecure_tls {
+                    self.insecure_tls = true;
+                }
+                if let Some(secs) = imported.timeout_secs {
+                    self.timeout_secs = secs;
+                }
+                self.toast = if imported.ignored.is_empty() {
+                    "imported curl command".to_owned()
+                } else {
+                    format!("imported; ignored {}", imported.ignored.join(", "))
+                };
+                self.curl_import_window = false;
+                self.curl_import_text.clear();
+                self.curl_import_error.clear();
+                self.persist_session();
+                true
+            }
+            Err(e) => {
+                self.curl_import_error = e;
+                false
+            }
+        }
+    }
+
     /// Something about the credential that will bite on send.
     fn credential_warning(&self) -> Option<String> {
         match self.cur.auth.kind {
@@ -302,6 +459,20 @@ impl ApiReqApp {
     fn send(&mut self, ctx: &egui::Context) {
         if self.inflight {
             return;
+        }
+        // a whole curl command in the url bar is a paste in the wrong box - parse
+        // it instead of firing a request at a mashed-up host
+        if crate::curl::looks_like_curl(&self.cur.url) {
+            self.curl_import_text = self.cur.url.clone();
+            if self.import_curl() {
+                self.toast = "parsed curl from the url field".to_owned();
+            } else {
+                self.error = Some(format!(
+                    "that looks like a curl command, not a url - {}",
+                    self.curl_import_error
+                ));
+                return;
+            }
         }
         self.inflight = true;
         self.error = None;
@@ -894,6 +1065,27 @@ impl ApiReqApp {
                     .suffix(" s"),
             );
             ui.separator();
+            if ui
+                .button("import curl")
+                .on_hover_text("paste a curl command and turn it into this request")
+                .clicked()
+            {
+                self.curl_import_window = true;
+                self.curl_import_error.clear();
+            }
+            if ui
+                .button("copy as curl")
+                .on_hover_text("copy this request as a curl command line")
+                .clicked()
+            {
+                let command = self.as_curl();
+                ui.ctx().copy_text(command);
+                self.toast = "copied as curl".to_owned();
+            }
+            if ui.button("show curl").clicked() {
+                self.curl_window = true;
+            }
+            ui.separator();
             ui.checkbox(&mut self.insecure_tls, "insecure tls")
                 .on_hover_text(
                     "skip certificate checks - for a local https dev server with a                      self-signed cert. Leave it off for anything you do not control.",
@@ -944,6 +1136,15 @@ impl ApiReqApp {
                     .clicked()
                 {
                     self.cur.url = swap_to_localhost(&self.cur.url, port);
+                }
+            }
+            // caught a curl command in the url field: offer to parse it
+            if crate::curl::looks_like_curl(&self.cur.url) {
+                ui.separator();
+                ui.colored_label(Color32::from_rgb(0xff, 0xa7, 0x26), "that's a curl command");
+                if ui.small_button("parse it").clicked() {
+                    self.curl_import_text = self.cur.url.clone();
+                    self.import_curl();
                 }
             }
         });
@@ -999,6 +1200,7 @@ impl ApiReqApp {
             );
             let n_extract = self.cur.extract.iter().filter(|e| e.active()).count();
             ui.selectable_value(&mut self.tab, Tab::Extract, format!("extract ({n_extract})"));
+            ui.selectable_value(&mut self.tab, Tab::Options, "options".to_owned());
         });
         ui.separator();
 
@@ -1238,6 +1440,86 @@ impl ApiReqApp {
                         }
                         None => {}
                     }
+                }
+                Tab::Options => {
+                    let t = &mut self.cur.transport;
+                    ui.weak("connection options, saved with the request and carried in curl");
+                    ui.add_space(6.0);
+                    egui::Grid::new("transport_opts")
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("redirects");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut t.follow_redirects, "follow (-L)");
+                                ui.add_enabled(
+                                    t.follow_redirects,
+                                    egui::DragValue::new(&mut t.max_redirects)
+                                        .range(0..=50)
+                                        .prefix("max "),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("compression");
+                            ui.checkbox(&mut t.compressed, "gzip / brotli / deflate (--compressed)");
+                            ui.end_row();
+
+                            ui.label("proxy");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut t.proxy)
+                                    .desired_width(360.0)
+                                    .hint_text("http://proxy:8080 - empty uses the system proxy"),
+                            );
+                            ui.end_row();
+
+                            ui.label("ca cert");
+                            ui.horizontal(|ui| {
+                                if ui.small_button("file...").clicked() {
+                                    if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                        t.ca_cert = f.display().to_string();
+                                    }
+                                }
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut t.ca_cert)
+                                        .desired_width(300.0)
+                                        .hint_text("extra root certificate, PEM (--cacert)"),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("client cert");
+                            ui.horizontal(|ui| {
+                                if ui.small_button("file...").clicked() {
+                                    if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                        t.client_cert = f.display().to_string();
+                                    }
+                                }
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut t.client_cert)
+                                        .desired_width(300.0)
+                                        .hint_text("PEM (-E)"),
+                                );
+                            });
+                            ui.end_row();
+
+                            ui.label("client key");
+                            ui.horizontal(|ui| {
+                                if ui.small_button("file...").clicked() {
+                                    if let Some(f) = rfd::FileDialog::new().pick_file() {
+                                        t.client_key = f.display().to_string();
+                                    }
+                                }
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut t.client_key)
+                                        .desired_width(300.0)
+                                        .hint_text("PEM (--key)"),
+                                );
+                            });
+                            ui.end_row();
+                        });
+                    ui.add_space(8.0);
+                    ui.weak("timeout and insecure tls live in the top bar - they apply to every request");
                 }
                 Tab::Extract => {
                     ui.weak(
@@ -2469,6 +2751,7 @@ impl eframe::App for ApiReqApp {
             Mode::Chain => self.chain_editor(ui, &ctx),
         });
 
+        self.curl_windows(&ctx);
         self.autosave_draft(&ctx);
     }
 
