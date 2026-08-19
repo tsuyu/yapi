@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +517,120 @@ pub fn base64(input: &[u8]) -> String {
     out
 }
 
+/// Where an extracted value is read from in a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExtractFrom {
+    JsonPath,
+    Header,
+    Cookie,
+    Regex,
+    Status,
+    Body,
+}
+
+impl ExtractFrom {
+    pub const ALL: [ExtractFrom; 6] = [
+        ExtractFrom::JsonPath,
+        ExtractFrom::Header,
+        ExtractFrom::Cookie,
+        ExtractFrom::Regex,
+        ExtractFrom::Status,
+        ExtractFrom::Body,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExtractFrom::JsonPath => "jsonpath",
+            ExtractFrom::Header => "header",
+            ExtractFrom::Cookie => "cookie",
+            ExtractFrom::Regex => "regex",
+            ExtractFrom::Status => "status",
+            ExtractFrom::Body => "whole body",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            ExtractFrom::JsonPath => "$.access_token",
+            ExtractFrom::Header => "Location",
+            ExtractFrom::Cookie => "session",
+            ExtractFrom::Regex => "csrf_token\\W+([a-z0-9]+)",
+            ExtractFrom::Status => "(no expression)",
+            ExtractFrom::Body => "(no expression)",
+        }
+    }
+
+    pub fn needs_expr(self) -> bool {
+        !matches!(self, ExtractFrom::Status | ExtractFrom::Body)
+    }
+}
+
+/// One "pull this out of the response into a variable" rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Extract {
+    pub on: bool,
+    /// Variable name, usable as `{{name}}` in any later request.
+    pub var: String,
+    pub from: ExtractFrom,
+    pub expr: String,
+}
+
+impl Default for Extract {
+    fn default() -> Self {
+        Self {
+            on: true,
+            var: String::new(),
+            from: ExtractFrom::JsonPath,
+            expr: String::new(),
+        }
+    }
+}
+
+impl Extract {
+    pub fn active(&self) -> bool {
+        self.on && !self.var.trim().is_empty()
+    }
+}
+
+/// An ordered run of saved requests, with values flowing between them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Chain {
+    pub name: String,
+    pub steps: Vec<ChainStep>,
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self {
+            name: "new chain".to_owned(),
+            steps: Vec::new(),
+        }
+    }
+}
+
+/// A chain step names a saved request rather than copying it, so editing the
+/// request updates every chain that uses it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChainStep {
+    pub on: bool,
+    pub request: String,
+    /// Keep going when this step fails or returns >= 400.
+    pub keep_going: bool,
+}
+
+impl Default for ChainStep {
+    fn default() -> Self {
+        Self {
+            on: true,
+            request: String::new(),
+            keep_going: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestSpec {
@@ -533,6 +649,8 @@ pub struct RequestSpec {
     pub binary_path: String,
     pub binary_content_type: String,
     pub auth: Auth,
+    /// Values pulled out of this request's response, for later requests.
+    pub extract: Vec<Extract>,
 }
 
 impl Default for RequestSpec {
@@ -551,6 +669,7 @@ impl Default for RequestSpec {
             binary_path: String::new(),
             binary_content_type: String::new(),
             auth: Auth::default(),
+            extract: vec![Extract::default()],
         }
     }
 }
@@ -575,6 +694,89 @@ impl RequestSpec {
         } else {
             format!("{path}?{}", parts.join("&"))
         }
+    }
+
+    /// A copy with every `{{variable}}` filled in, ready to send.
+    pub fn resolve(&self, vars: &BTreeMap<String, String>) -> RequestSpec {
+        let sub = |text: &String| substitute(text, vars);
+        let sub_rows = |rows: &Vec<KeyVal>| -> Vec<KeyVal> {
+            rows.iter()
+                .map(|r| KeyVal {
+                    on: r.on,
+                    key: substitute(&r.key, vars),
+                    value: substitute(&r.value, vars),
+                })
+                .collect()
+        };
+
+        let mut auth = self.auth.clone();
+        auth.token = sub(&auth.token);
+        auth.username = sub(&auth.username);
+        auth.password = sub(&auth.password);
+        auth.api_key_name = sub(&auth.api_key_name);
+        auth.api_key_value = sub(&auth.api_key_value);
+        auth.jwt.token = sub(&auth.jwt.token);
+        auth.oauth.access_token = sub(&auth.oauth.access_token);
+        auth.oauth.client_id = sub(&auth.oauth.client_id);
+        auth.oauth.client_secret = sub(&auth.oauth.client_secret);
+        auth.oauth.token_url = sub(&auth.oauth.token_url);
+        auth.oauth.auth_url = sub(&auth.oauth.auth_url);
+        auth.oauth.scope = sub(&auth.oauth.scope);
+
+        RequestSpec {
+            name: self.name.clone(),
+            method: self.method,
+            url: sub(&self.url),
+            params: sub_rows(&self.params),
+            path_params: sub_rows(&self.path_params),
+            headers: sub_rows(&self.headers),
+            cookies: sub_rows(&self.cookies),
+            body_kind: self.body_kind,
+            body: sub(&self.body),
+            form_parts: self
+                .form_parts
+                .iter()
+                .map(|p| FormPart {
+                    on: p.on,
+                    key: substitute(&p.key, vars),
+                    value: substitute(&p.value, vars),
+                    file: substitute(&p.file, vars),
+                    content_type: p.content_type.clone(),
+                })
+                .collect(),
+            binary_path: sub(&self.binary_path),
+            binary_content_type: self.binary_content_type.clone(),
+            auth,
+            extract: self.extract.clone(),
+        }
+    }
+
+    /// Every `{{name}}` used anywhere in this request that has no value.
+    pub fn missing_vars(&self, vars: &BTreeMap<String, String>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut scan = |text: &str| {
+            for name in unresolved_vars(text, vars) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        };
+        scan(&self.url);
+        scan(&self.body);
+        for row in self
+            .params
+            .iter()
+            .chain(&self.path_params)
+            .chain(&self.headers)
+            .chain(&self.cookies)
+        {
+            scan(&row.key);
+            scan(&row.value);
+        }
+        scan(&self.auth.token);
+        scan(&self.auth.api_key_value);
+        scan(&self.auth.jwt.token);
+        out
     }
 
     /// Cookie header value built from the cookies table.
@@ -633,6 +835,9 @@ impl RequestSpec {
 #[serde(default)]
 pub struct Collection {
     pub requests: Vec<RequestSpec>,
+    pub chains: Vec<Chain>,
+    /// Starting values for `{{name}}` substitution, before anything is extracted.
+    pub variables: Vec<KeyVal>,
 }
 
 /// `:name` and `{name}` placeholders found in a url, in order, deduplicated.
@@ -655,9 +860,16 @@ pub fn placeholders(url: &str) -> Vec<String> {
                 }
                 i = (start + len).max(i + 1);
             }
+            b'{' if url[i..].starts_with("{{") => {
+                // `{{name}}` is a variable, not a path placeholder
+                match url[i..].find("}}") {
+                    Some(rel) => i += rel + 2,
+                    None => i += 2,
+                }
+            }
             b'{' => {
                 if let Some(rel) = url[i..].find('}') {
-                    let name = url[i + 1..i + rel].trim().trim_matches('{');
+                    let name = url[i + 1..i + rel].trim();
                     if !name.is_empty() {
                         push_unique(&mut out, name);
                     }
@@ -685,8 +897,8 @@ pub fn apply_path_params(url: &str, params: &[KeyVal]) -> String {
     for p in params.iter().filter(|p| p.active() && !p.value.is_empty()) {
         let name = p.key.trim();
         let value = encode_path(&p.value);
+        // only `{name}` and `:name`; `{{name}}` belongs to variable substitution
         out = out
-            .replace(&format!("{{{{{name}}}}}"), &value)
             .replace(&format!("{{{name}}}"), &value)
             .replace(&format!(":{name}"), &value);
     }
@@ -704,6 +916,56 @@ pub fn encode_path(s: &str) -> String {
             }
             _ => out.push_str(&format!("%{b:02X}")),
         }
+    }
+    out
+}
+
+/// Replace every `{{name}}` with its variable value. Unknown names are left
+/// alone so the gap is visible in the url preview rather than silently empty.
+pub fn substitute(text: &str, vars: &BTreeMap<String, String>) -> String {
+    if !text.contains("{{") {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        match after.find("}}") {
+            Some(close) => {
+                let name = after[..close].trim();
+                match vars.get(name) {
+                    Some(value) => out.push_str(value),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(&after[..close]);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[close + 2..];
+            }
+            None => {
+                out.push_str(&rest[open..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `{{name}}` references in a string that have no value yet.
+pub fn unresolved_vars(text: &str, vars: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else { break };
+        let name = after[..close].trim();
+        if !name.is_empty() && !vars.contains_key(name) && !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
+        }
+        rest = &after[close + 2..];
     }
     out
 }
@@ -1079,5 +1341,104 @@ mod tests {
         o.expires_at = now_unix() + 600;
         assert!(!o.expired());
         assert!(o.seconds_left().unwrap() > 590);
+    }
+
+    fn vars() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("token".to_owned(), "abc123".to_owned()),
+            ("user_id".to_owned(), "42".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn substitutes_known_variables_only() {
+        assert_eq!(substitute("Bearer {{token}}", &vars()), "Bearer abc123");
+        assert_eq!(substitute("{{ user_id }}", &vars()), "42");
+        assert_eq!(substitute("/a/{{user_id}}/b/{{token}}", &vars()), "/a/42/b/abc123");
+        // unknown names stay put so the gap is visible
+        assert_eq!(substitute("{{nope}}", &vars()), "{{nope}}");
+        assert_eq!(substitute("no braces", &vars()), "no braces");
+        assert_eq!(substitute("{{unclosed", &vars()), "{{unclosed");
+    }
+
+    #[test]
+    fn reports_unresolved_variables() {
+        assert_eq!(unresolved_vars("{{a}} {{token}} {{b}}", &vars()), vec!["a", "b"]);
+        assert!(unresolved_vars("{{token}}", &vars()).is_empty());
+    }
+
+    #[test]
+    fn variables_and_path_params_do_not_collide() {
+        // {{user_id}} is a variable; {postId} and :id are path params
+        let url = "https://x.dev/users/{{user_id}}/posts/{postId}/c/:id";
+        assert_eq!(placeholders(url), vec!["postId".to_owned(), "id".to_owned()]);
+
+        let spec = RequestSpec {
+            url: url.to_owned(),
+            params: vec![],
+            path_params: vec![
+                KeyVal { on: true, key: "postId".into(), value: "7".into() },
+                KeyVal { on: true, key: "id".into(), value: "9".into() },
+            ],
+            ..Default::default()
+        };
+        let resolved = spec.resolve(&vars());
+        assert_eq!(resolved.full_url(), "https://x.dev/users/42/posts/7/c/9");
+    }
+
+    #[test]
+    fn resolve_reaches_headers_body_and_auth() {
+        let spec = RequestSpec {
+            url: "x.dev/{{user_id}}".to_owned(),
+            headers: vec![KeyVal {
+                on: true,
+                key: "X-Trace".into(),
+                value: "{{token}}".into(),
+            }],
+            cookies: vec![KeyVal {
+                on: true,
+                key: "sid".into(),
+                value: "{{token}}".into(),
+            }],
+            body_kind: BodyKind::Json,
+            body: r#"{"id":"{{user_id}}"}"#.to_owned(),
+            auth: Auth {
+                kind: AuthKind::Bearer,
+                token: "{{token}}".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let r = spec.resolve(&vars());
+        assert_eq!(r.headers[0].value, "abc123");
+        assert_eq!(r.cookies[0].value, "abc123");
+        assert_eq!(r.body, r#"{"id":"42"}"#);
+        assert_eq!(
+            r.auth.header(),
+            Some(("Authorization".to_owned(), "Bearer abc123".to_owned()))
+        );
+        // the original is untouched
+        assert_eq!(spec.auth.token, "{{token}}");
+    }
+
+    #[test]
+    fn missing_vars_are_listed_from_everywhere() {
+        let spec = RequestSpec {
+            url: "x.dev/{{a}}".to_owned(),
+            body: "{{b}}".to_owned(),
+            headers: vec![KeyVal {
+                on: true,
+                key: "H".into(),
+                value: "{{c}}".into(),
+            }],
+            auth: Auth {
+                kind: AuthKind::Bearer,
+                token: "{{token}}".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let missing = spec.missing_vars(&vars());
+        assert_eq!(missing, vec!["a", "b", "c"]);
     }
 }

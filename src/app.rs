@@ -1,12 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
+use crate::chain::{self, ChainMsg};
 use crate::model::{
-    ApiKeyIn, AuthKind, BodyKind, ClientAuth, Collection, FormPart, Grant, KeyVal, Method,
-    RequestSpec,
+    ApiKeyIn, AuthKind, BodyKind, Chain, ChainStep, ClientAuth, Collection, Extract, ExtractFrom,
+    FormPart, Grant, KeyVal, Method, RequestSpec,
 };
 use crate::oauth::{self, TokenMsg};
 use crate::net::{self, Msg, ResponseData, SendOpts, Shape};
@@ -20,6 +22,21 @@ enum Tab {
     Cookies,
     Auth,
     Body,
+    Extract,
+}
+
+/// The sidebar shows requests or chains; the centre follows.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    Request,
+    Chain,
+}
+
+/// One line of a chain run, as it happened.
+struct ChainLog {
+    label: String,
+    detail: String,
+    color: Color32,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -101,6 +118,15 @@ pub struct ApiReqApp {
     token_tx: Sender<TokenMsg>,
     token_rx: Receiver<TokenMsg>,
     token_inflight: bool,
+    /// Variables available for `{{name}}` substitution right now.
+    vars: BTreeMap<String, String>,
+    mode: Mode,
+    selected_chain: Option<usize>,
+    chain_tx: Sender<ChainMsg>,
+    chain_rx: Receiver<ChainMsg>,
+    chain_running: bool,
+    chain_log: Vec<ChainLog>,
+    new_var: String,
     oauth_status: String,
     oauth_raw: Option<String>,
     jwt_error: String,
@@ -115,6 +141,7 @@ impl ApiReqApp {
 
         // pick up exactly where the last run left off, unsaved edits included
         let session = store::load_session(&session_path);
+        let session_vars = session.as_ref().map(|s| s.vars.clone());
         let (cur, selected, timeout_secs, insecure_tls) = match session {
             Some(s) => {
                 let selected = s.selected.filter(|i| *i < coll.requests.len());
@@ -133,10 +160,34 @@ impl ApiReqApp {
 
         let (tx, rx) = channel();
         let (token_tx, token_rx) = channel();
+        let (chain_tx, chain_rx) = channel();
+        let defaults: BTreeMap<String, String> = coll
+            .variables
+            .iter()
+            .filter(|v| v.active())
+            .map(|v| (v.key.trim().to_owned(), v.value.clone()))
+            .collect();
+        // anything extracted before the app closed is still useful now
+        let vars = match &session_vars {
+            Some(saved) if !saved.is_empty() => {
+                let mut merged = defaults;
+                merged.extend(saved.clone());
+                merged
+            }
+            _ => defaults,
+        };
         Self {
             token_tx,
             token_rx,
             token_inflight: false,
+            vars,
+            mode: Mode::Request,
+            selected_chain: None,
+            chain_tx,
+            chain_rx,
+            chain_running: false,
+            chain_log: Vec::new(),
+            new_var: String::new(),
             oauth_status: String::new(),
             oauth_raw: None,
             jwt_error: String::new(),
@@ -177,6 +228,7 @@ impl ApiReqApp {
             selected: self.selected,
             timeout_secs: self.timeout_secs,
             insecure_tls: self.insecure_tls,
+            vars: self.vars.clone(),
         };
         if store::save_session(&self.session_path, &session).is_ok() {
             self.draft_on_disk = self.cur.clone();
@@ -254,7 +306,8 @@ impl ApiReqApp {
         self.inflight = true;
         self.error = None;
         self.toast.clear();
-        net::spawn(self.cur.clone(), self.send_opts(), self.tx.clone(), ctx.clone());
+        let resolved = self.cur.resolve(&self.vars);
+        net::spawn(resolved, self.send_opts(), self.tx.clone(), ctx.clone());
     }
 
     fn send_opts(&self) -> SendOpts {
@@ -264,7 +317,126 @@ impl ApiReqApp {
         }
     }
 
+    fn drain_chain(&mut self) {
+        while let Ok(msg) = self.chain_rx.try_recv() {
+            match msg {
+                ChainMsg::Started { index, name } => self.chain_log.push(ChainLog {
+                    label: format!("{}. {name}", index + 1),
+                    detail: "running...".to_owned(),
+                    color: Color32::GRAY,
+                }),
+                ChainMsg::Done {
+                    index,
+                    name,
+                    status,
+                    elapsed_ms,
+                    extracted,
+                    warnings,
+                } => {
+                    for (k, v) in &extracted {
+                        self.vars.insert(k.clone(), v.clone());
+                    }
+                    let mut detail = format!("{status} in {elapsed_ms} ms");
+                    if !extracted.is_empty() {
+                        let names: Vec<&str> =
+                            extracted.iter().map(|(k, _)| k.as_str()).collect();
+                        detail.push_str(&format!("  ->  {}", names.join(", ")));
+                    }
+                    if !warnings.is_empty() {
+                        detail.push_str(&format!("  ({})", warnings.join("; ")));
+                    }
+                    let color = if status < 400 {
+                        Color32::from_rgb(0x4c, 0xaf, 0x50)
+                    } else {
+                        Color32::from_rgb(0xef, 0x53, 0x50)
+                    };
+                    self.replace_log(index, &name, detail, color);
+                }
+                ChainMsg::Failed { index, name, error } => {
+                    self.replace_log(index, &name, error, Color32::from_rgb(0xef, 0x53, 0x50));
+                }
+                ChainMsg::Finished { ran, ok } => {
+                    self.chain_running = false;
+                    self.chain_log.push(ChainLog {
+                        label: if ok { "done".to_owned() } else { "stopped".to_owned() },
+                        detail: format!("{ran} step(s)"),
+                        color: if ok {
+                            Color32::from_rgb(0x4c, 0xaf, 0x50)
+                        } else {
+                            Color32::from_rgb(0xff, 0xa7, 0x26)
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Overwrite the "running..." line for a step with its outcome.
+    fn replace_log(&mut self, index: usize, name: &str, detail: String, color: Color32) {
+        let label = format!("{}. {name}", index + 1);
+        match self.chain_log.iter_mut().rev().find(|l| l.label == label) {
+            Some(line) => {
+                line.detail = detail;
+                line.color = color;
+            }
+            None => self.chain_log.push(ChainLog {
+                label,
+                detail,
+                color,
+            }),
+        }
+    }
+
+    fn run_chain(&mut self, ctx: &egui::Context) {
+        let Some(chain) = self.selected_chain.and_then(|i| self.coll.chains.get(i)) else {
+            return;
+        };
+        let mut steps = Vec::new();
+        let mut missing = Vec::new();
+        for step in chain.steps.iter().filter(|s| s.on) {
+            match self
+                .coll
+                .requests
+                .iter()
+                .find(|r| r.name == step.request)
+            {
+                Some(spec) => steps.push(chain::Step {
+                    spec: spec.clone(),
+                    keep_going: step.keep_going,
+                }),
+                None => missing.push(step.request.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            self.chain_log = vec![ChainLog {
+                label: "cannot run".to_owned(),
+                detail: format!("no saved request named {}", missing.join(", ")),
+                color: Color32::from_rgb(0xef, 0x53, 0x50),
+            }];
+            return;
+        }
+        if steps.is_empty() {
+            self.chain_log = vec![ChainLog {
+                label: "cannot run".to_owned(),
+                detail: "this chain has no enabled steps".to_owned(),
+                color: Color32::from_rgb(0xff, 0xa7, 0x26),
+            }];
+            return;
+        }
+
+        self.chain_log.clear();
+        self.chain_running = true;
+        chain::spawn_run(
+            steps,
+            self.vars.clone(),
+            self.send_opts(),
+            self.chain_tx.clone(),
+            ctx.clone(),
+        );
+    }
+
     fn drain(&mut self) {
+        self.drain_chain();
         while let Ok(msg) = self.token_rx.try_recv() {
             match msg {
                 TokenMsg::Status(line) => self.oauth_status = line,
@@ -291,6 +463,19 @@ impl ApiReqApp {
             self.inflight = false;
             match msg {
                 Msg::Done(r) => {
+                    // whatever this response teaches us is available to the next request
+                    let out = crate::extract::apply(&self.cur.extract, &r);
+                    if !out.values.is_empty() {
+                        let names: Vec<&str> =
+                            out.values.iter().map(|(k, _)| k.as_str()).collect();
+                        self.toast = format!("extracted {}", names.join(", "));
+                        for (k, v) in out.values {
+                            self.vars.insert(k, v);
+                        }
+                    }
+                    if !out.errors.is_empty() {
+                        self.toast = format!("extract: {}", out.errors.join("; "));
+                    }
                     self.body_view = views_for(r.shape)[0];
                     self.resp = Some(*r);
                     self.resp_tab = RespTab::Body;
@@ -308,8 +493,16 @@ impl ApiReqApp {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.heading("saved");
-        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.mode, Mode::Request, "requests");
+            ui.selectable_value(&mut self.mode, Mode::Chain, "chains");
+        });
+        ui.separator();
+
+        if self.mode == Mode::Chain {
+            self.chain_sidebar(ui);
+            return;
+        }
 
         ui.horizontal(|ui| {
             if ui.button("new").clicked() {
@@ -406,6 +599,267 @@ impl ApiReqApp {
             }
         });
         ui.weak(RichText::new(self.path.display().to_string()).size(9.0));
+        ui.separator();
+        self.variables_panel(ui);
+    }
+
+    /// Current `{{name}}` values: collection defaults plus anything extracted.
+    fn variables_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(format!("variables ({})", self.vars.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut remove: Option<String> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("vars_scroll")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("vars_grid")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([6.0, 3.0])
+                            .show(ui, |ui| {
+                                for (name, value) in self.vars.iter_mut() {
+                                    ui.label(RichText::new(name).strong());
+                                    ui.add(
+                                        egui::TextEdit::singleline(value)
+                                            .desired_width(110.0)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                    if ui.small_button("x").clicked() {
+                                        remove = Some(name.clone());
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        if self.vars.is_empty() {
+                            ui.weak("none yet - extract some, or add one below");
+                        }
+                    });
+                if let Some(name) = remove {
+                    self.vars.remove(&name);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_var)
+                            .desired_width(110.0)
+                            .hint_text("new name"),
+                    );
+                    if ui.small_button("+").clicked() && !self.new_var.trim().is_empty() {
+                        self.vars
+                            .insert(self.new_var.trim().to_owned(), String::new());
+                        self.new_var.clear();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("save as defaults")
+                        .on_hover_text("store these in the collection file")
+                        .clicked()
+                    {
+                        self.coll.variables = self
+                            .vars
+                            .iter()
+                            .map(|(k, v)| KeyVal {
+                                on: true,
+                                key: k.clone(),
+                                value: v.clone(),
+                            })
+                            .collect();
+                        self.persist();
+                    }
+                    if ui
+                        .small_button("reset")
+                        .on_hover_text("back to the saved defaults")
+                        .clicked()
+                    {
+                        self.vars = self
+                            .coll
+                            .variables
+                            .iter()
+                            .filter(|v| v.active())
+                            .map(|v| (v.key.trim().to_owned(), v.value.clone()))
+                            .collect();
+                    }
+                });
+            });
+    }
+
+    fn chain_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("new chain").clicked() {
+                self.coll.chains.push(Chain::default());
+                self.selected_chain = Some(self.coll.chains.len() - 1);
+                self.persist();
+            }
+        });
+        ui.separator();
+
+        let mut delete = None;
+        egui::ScrollArea::vertical()
+            .id_salt("chains_scroll")
+            .max_height(ui.available_height() - 190.0)
+            .show(ui, |ui| {
+                for i in 0..self.coll.chains.len() {
+                    let label = format!(
+                        "{}  ({} steps)",
+                        self.coll.chains[i].name,
+                        self.coll.chains[i].steps.len()
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.selected_chain == Some(i), label)
+                            .clicked()
+                        {
+                            self.selected_chain = Some(i);
+                            self.chain_log.clear();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("x").clicked() {
+                                delete = Some(i);
+                            }
+                        });
+                    });
+                }
+                if self.coll.chains.is_empty() {
+                    ui.weak("no chains yet");
+                }
+            });
+        if let Some(i) = delete {
+            self.coll.chains.remove(i);
+            self.selected_chain = None;
+            self.persist();
+        }
+
+        ui.separator();
+        self.variables_panel(ui);
+    }
+
+    /// Centre panel when a chain is selected: steps, run button, run log.
+    fn chain_editor(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(index) = self.selected_chain else {
+            ui.add_space(8.0);
+            ui.weak("pick a chain on the left, or make one");
+            return;
+        };
+        if index >= self.coll.chains.len() {
+            self.selected_chain = None;
+            return;
+        }
+
+        let request_names: Vec<String> =
+            self.coll.requests.iter().map(|r| r.name.clone()).collect();
+        let mut dirty = false;
+        let mut run_now = false;
+
+        ui.horizontal(|ui| {
+            ui.label("chain");
+            let chain = &mut self.coll.chains[index];
+            if ui
+                .add(egui::TextEdit::singleline(&mut chain.name).desired_width(240.0))
+                .changed()
+            {
+                dirty = true;
+            }
+            if ui
+                .add_enabled(!self.chain_running, egui::Button::new("run chain"))
+                .clicked()
+            {
+                run_now = true;
+            }
+            if self.chain_running {
+                ui.spinner();
+            }
+            if ui.button("save").clicked() {
+                dirty = true;
+            }
+        });
+        ui.weak("each step runs in order; values extracted by one step feed the next");
+        ui.separator();
+
+        let mut remove: Option<usize> = None;
+        let mut move_up: Option<usize> = None;
+        {
+            let chain = &mut self.coll.chains[index];
+            egui::Grid::new("chain_steps")
+                .num_columns(5)
+                .striped(true)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    for (i, step) in chain.steps.iter_mut().enumerate() {
+                        dirty |= ui.checkbox(&mut step.on, "").changed();
+                        ui.label(format!("{}.", i + 1));
+                        egui::ComboBox::from_id_salt(("chain_step", i))
+                            .width(240.0)
+                            .selected_text(if step.request.is_empty() {
+                                "pick a request".to_owned()
+                            } else {
+                                step.request.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                for name in &request_names {
+                                    if ui
+                                        .selectable_label(&step.request == name, name)
+                                        .clicked()
+                                    {
+                                        step.request = name.clone();
+                                        dirty = true;
+                                    }
+                                }
+                            });
+                        dirty |= ui
+                            .checkbox(&mut step.keep_going, "keep going on failure")
+                            .changed();
+                        ui.horizontal(|ui| {
+                            if i > 0 && ui.small_button("up").clicked() {
+                                move_up = Some(i);
+                            }
+                            if ui.small_button("x").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+
+            if let Some(i) = remove {
+                chain.steps.remove(i);
+                dirty = true;
+            }
+            if let Some(i) = move_up {
+                chain.steps.swap(i - 1, i);
+                dirty = true;
+            }
+            if ui.button("+ step").clicked() {
+                chain.steps.push(ChainStep::default());
+                dirty = true;
+            }
+        }
+
+        if dirty {
+            self.persist();
+        }
+        if run_now {
+            self.run_chain(ctx);
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.strong("run log");
+        egui::ScrollArea::vertical()
+            .id_salt("chain_log")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.chain_log.is_empty() {
+                    ui.weak("not run yet");
+                }
+                for line in &self.chain_log {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(line.color, &line.label);
+                        ui.weak(&line.detail);
+                    });
+                }
+            });
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -494,7 +948,18 @@ impl ApiReqApp {
             }
         });
 
-        ui.weak(RichText::new(self.cur.full_url()).size(10.0));
+        let resolved = self.cur.resolve(&self.vars);
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(RichText::new(resolved.full_url()).size(10.0));
+            let missing = self.cur.missing_vars(&self.vars);
+            if !missing.is_empty() {
+                ui.colored_label(
+                    Color32::from_rgb(0xff, 0xa7, 0x26),
+                    RichText::new(format!("unset: {}", missing.join(", "))).size(10.0),
+                )
+                .on_hover_text("set these in the variables panel, or extract them from an earlier request");
+            }
+        });
         ui.add_space(4.0);
     }
 
@@ -532,6 +997,8 @@ impl ApiReqApp {
                 Tab::Body,
                 format!("body ({})", self.cur.body_kind.as_str()),
             );
+            let n_extract = self.cur.extract.iter().filter(|e| e.active()).count();
+            ui.selectable_value(&mut self.tab, Tab::Extract, format!("extract ({n_extract})"));
         });
         ui.separator();
 
@@ -771,6 +1238,14 @@ impl ApiReqApp {
                         }
                         None => {}
                     }
+                }
+                Tab::Extract => {
+                    ui.weak(
+                        "pull values out of this response into variables, then use them as \
+                         {{name}} in any later request",
+                    );
+                    ui.add_space(4.0);
+                    extract_editor(ui, &mut self.cur.extract, &self.vars);
                 }
                 Tab::Body => {
                     ui.horizontal_wrapped(|ui| {
@@ -1198,6 +1673,83 @@ impl ApiReqApp {
                 Err(e) => format!("save failed: {e}"),
             };
         }
+    }
+}
+
+fn extract_editor(
+    ui: &mut egui::Ui,
+    rows: &mut Vec<Extract>,
+    vars: &BTreeMap<String, String>,
+) {
+    let mut delete: Option<usize> = None;
+    egui::Grid::new("extract_rules")
+        .num_columns(6)
+        .striped(true)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("");
+            ui.strong("variable");
+            ui.strong("from");
+            ui.strong("expression");
+            ui.strong("current value");
+            ui.label("");
+            ui.end_row();
+
+            for (i, row) in rows.iter_mut().enumerate() {
+                ui.checkbox(&mut row.on, "");
+                ui.add(
+                    egui::TextEdit::singleline(&mut row.var)
+                        .desired_width(140.0)
+                        .hint_text("access_token"),
+                );
+                egui::ComboBox::from_id_salt(("extract_from", i))
+                    .width(110.0)
+                    .selected_text(row.from.as_str())
+                    .show_ui(ui, |ui| {
+                        for f in ExtractFrom::ALL {
+                            ui.selectable_value(&mut row.from, f, f.as_str());
+                        }
+                    });
+                ui.add_enabled(
+                    row.from.needs_expr(),
+                    egui::TextEdit::singleline(&mut row.expr)
+                        .desired_width(260.0)
+                        .hint_text(row.from.hint()),
+                );
+                match vars.get(row.var.trim()) {
+                    Some(value) => {
+                        ui.colored_label(
+                            Color32::from_rgb(0x9c, 0xcc, 0x65),
+                            RichText::new(truncate(value, 40)).monospace(),
+                        );
+                    }
+                    None => {
+                        ui.weak("-");
+                    }
+                }
+                if ui.small_button("x").clicked() {
+                    delete = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+
+    if let Some(i) = delete {
+        rows.remove(i);
+    }
+    if ui.button("+ rule").clicked() {
+        rows.push(Extract::default());
+    }
+    if rows.last().map(|r| !r.var.trim().is_empty()).unwrap_or(true) {
+        rows.push(Extract::default());
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        format!("{}...", text.chars().take(max).collect::<String>())
     }
 }
 
@@ -1902,15 +2454,20 @@ impl eframe::App for ApiReqApp {
             .default_size(250.0)
             .show(ui, |ui| self.sidebar(ui));
 
-        egui::Panel::top("req_top").show(ui, |ui| self.top_bar(ui, &ctx));
+        if self.mode == Mode::Request {
+            egui::Panel::top("req_top").show(ui, |ui| self.top_bar(ui, &ctx));
 
-        egui::Panel::bottom("resp")
-            .resizable(true)
-            .default_size(340.0)
-            .min_size(120.0)
-            .show(ui, |ui| self.response_panel(ui));
+            egui::Panel::bottom("resp")
+                .resizable(true)
+                .default_size(340.0)
+                .min_size(120.0)
+                .show(ui, |ui| self.response_panel(ui));
+        }
 
-        egui::CentralPanel::default().show(ui, |ui| self.request_editor(ui));
+        egui::CentralPanel::default().show(ui, |ui| match self.mode {
+            Mode::Request => self.request_editor(ui),
+            Mode::Chain => self.chain_editor(ui, &ctx),
+        });
 
         self.autosave_draft(&ctx);
     }

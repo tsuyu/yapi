@@ -14,6 +14,8 @@ pub struct Session {
     pub selected: Option<usize>,
     pub timeout_secs: u64,
     pub insecure_tls: bool,
+    /// Variables as they stood, extracted ones included.
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Session {
@@ -23,6 +25,7 @@ impl Default for Session {
             selected: None,
             timeout_secs: 30,
             insecure_tls: false,
+            vars: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -108,6 +111,12 @@ mod tests {
                 api_key_in: ApiKeyIn::Query,
                 ..Default::default()
             },
+            extract: vec![crate::model::Extract {
+                on: true,
+                var: "token".into(),
+                from: crate::model::ExtractFrom::JsonPath,
+                expr: "$.access_token".into(),
+            }],
         }
     }
 
@@ -127,10 +136,25 @@ mod tests {
         let path = tmp("coll");
         let coll = Collection {
             requests: vec![loaded_spec(), RequestSpec::default()],
+            chains: vec![crate::model::Chain {
+                name: "login flow".into(),
+                steps: vec![crate::model::ChainStep {
+                    on: true,
+                    request: "everything".into(),
+                    keep_going: false,
+                }],
+            }],
+            variables: vec![KeyVal {
+                on: true,
+                key: "base".into(),
+                value: "https://x.dev".into(),
+            }],
         };
         save(&path, &coll).unwrap();
         let back = load(&path);
         assert_eq!(back.requests, coll.requests);
+        assert_eq!(back.chains, coll.chains);
+        assert_eq!(back.variables, coll.variables);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -142,6 +166,7 @@ mod tests {
             selected: Some(3),
             timeout_secs: 90,
             insecure_tls: true,
+            vars: std::collections::BTreeMap::from([("token".to_owned(), "abc".to_owned())]),
         };
         save_session(&path, &session).unwrap();
         let back = load_session(&path).unwrap();
@@ -149,6 +174,7 @@ mod tests {
         assert_eq!(back.selected, Some(3));
         assert_eq!(back.timeout_secs, 90);
         assert!(back.insecure_tls);
+        assert_eq!(back.vars.get("token").map(String::as_str), Some("abc"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

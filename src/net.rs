@@ -151,6 +151,12 @@ pub fn spawn(spec: RequestSpec, opts: SendOpts, tx: Sender<Msg>, ctx: egui::Cont
     });
 }
 
+/// Send a request on the calling thread. Used by the chain runner, which is
+/// already on a worker thread of its own.
+pub fn run_blocking(spec: RequestSpec, opts: SendOpts) -> Result<ResponseData, String> {
+    run(spec, opts)
+}
+
 fn run(spec: RequestSpec, opts: SendOpts) -> Result<ResponseData, String> {
     let url = spec.full_url();
     if url.is_empty() {

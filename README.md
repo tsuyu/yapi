@@ -82,6 +82,56 @@ are sending, it is not a validator.
 
 The top bar warns before you send with a missing or expired credential.
 
+## Variables and chaining
+
+Any string in a request — url, query, path params, headers, cookies, body, form
+parts, auth fields — can contain `{{name}}`. Names resolve against the variable
+store; an unknown name is left as written and flagged `unset:` under the url bar
+rather than sent as an empty string.
+
+Variables come from two places, both in the sidebar panel: defaults saved with
+the collection (`save as defaults` / `reset`), and values **extracted from
+responses**.
+
+### Extraction
+
+The `extract` tab on any request pulls values out of its response:
+
+| from | expression | takes |
+|---|---|---|
+| jsonpath | `$.access_token` | the first match; json strings come out unquoted |
+| header | `Location` | that response header |
+| cookie | `session` | that `Set-Cookie` value |
+| regex | `value="([^"]+)"` | capture group 1, or the whole match |
+| status | — | the status code |
+| whole body | — | the entire body |
+
+Rules run after every send, single request or chain, so a value is available to
+the next request immediately. A rule that cannot be applied reports itself and
+does not stop the others. The tab shows each variable's current value.
+
+### Chains
+
+Switch the sidebar to **chains**. A chain is an ordered list of steps, each
+naming a saved request — editing that request updates every chain using it.
+`run chain` sends them in order on a worker thread, feeding each step's
+extractions into the ones that follow:
+
+```
+POST /login                      extract  $.access_token  ->  {{access_token}}
+GET  /users/me                   header   Authorization: Bearer {{access_token}}
+                                 extract  $.id            ->  {{user_id}}
+GET  /users/{{user_id}}
+```
+
+The run log shows each step's status, time, and the variables it produced. A
+step that fails, returns >= 400, or needs a variable nothing has set stops the
+chain — tick `keep going on failure` on a step to carry on regardless. A missing
+variable is caught before the request goes out.
+
+`{{name}}` is variable substitution and happens first; `{name}` and `:name` stay
+path params, so `/users/{{user_id}}/posts/{postId}` uses one of each.
+
 ## Response viewer
 
 Status (colour coded), elapsed ms, size in human units, detected shape, and the
@@ -133,7 +183,7 @@ cert — it disables validation entirely, so keep it for servers you run.
   method, query, path params, headers, cookies, body (including file paths and
   multipart parts), and the full auth config.
 - Draft autosave: whatever is in the editor right now, plus the timeout and
-  which entry is open, is written ~0.8s after you stop typing and again on exit,
+  which entry is open, plus the current variables, is written ~0.8s after you stop typing and again on exit,
   then restored next launch. Closing the window never loses typed input. The top
   bar flags `unsaved edits` when the draft differs from its sidebar entry.
 - `import` appends another collection file; `export` writes the whole collection
@@ -169,6 +219,8 @@ Secrets are masked in the UI until you tick `reveal`.
 - [src/jwt.rs](src/jwt.rs) — jwt decode and HS256 signing
 - [src/pretty.rs](src/pretty.rs) — xml/html formatting, tag stripping, hex dump
 - [src/jsonpath.rs](src/jsonpath.rs) — jsonpath parser and evaluator
+- [src/extract.rs](src/extract.rs) — response-to-variable extraction rules
+- [src/chain.rs](src/chain.rs) — sequential chain runner
 - [src/store.rs](src/store.rs) — collection and session persistence
 - [src/app.rs](src/app.rs) — egui UI
 
@@ -178,9 +230,12 @@ Secrets are masked in the UI until you tick `reveal`.
 cargo test
 ```
 
-62 tests. The network ones stand up a real HTTP server on a loopback port and
+75 tests. The network ones stand up a real HTTP server on a loopback port and
 assert on the bytes it receives: path substitution, cookie header, multipart
 boundaries and file parts, binary bodies, content-type precedence, and an oauth2
 token endpoint exchange; responses are round-tripped to check shape detection,
-xml indenting, image bytes surviving intact, and json key order. JWT signing is
+xml indenting, image bytes surviving intact, and json key order. A three-step
+chain (login, /users/me, /users/{{user_id}}) is run against a scripted server
+that checks the token reached the second request's header and the id reached the
+third one's url. JWT signing is
 checked against the jwt.io reference token and PKCE against RFC 7636 appendix B.
