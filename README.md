@@ -1,4 +1,4 @@
-# api-req
+# yAPI
 
 Desktop GUI for poking HTTP APIs. Rust + egui/eframe, blocking reqwest on a
 worker thread. Requests are saved to a JSON collection on disk.
@@ -235,9 +235,9 @@ cert — it disables validation entirely, so keep it for servers you run.
 
 Files, side by side:
 
-- Windows: `%APPDATA%\api-req\config\collection.json` + `session.json`
-- Linux: `~/.config/api-req/`
-- macOS: `~/Library/Application Support/api-req/`
+- Windows: `%APPDATA%\yAPI\config\collection.json` + `session.json`
+- Linux: `~/.config/yAPI/`
+- macOS: `~/Library/Application Support/yAPI/`
 
 A missing or corrupt file of either kind falls back to defaults rather than
 failing to start.

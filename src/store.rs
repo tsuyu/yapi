@@ -32,7 +32,7 @@ impl Default for Session {
 
 /// Where saved requests live by default (per-user config dir).
 pub fn default_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "api-req")
+    directories::ProjectDirs::from("", "", "yAPI")
         .map(|d| d.config_dir().join("collection.json"))
         .unwrap_or_else(|| PathBuf::from("collection.json"))
 }
@@ -76,7 +76,7 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("api-req-test-{name}-{}", std::process::id()));
+        p.push(format!("yapi-test-{name}-{}", std::process::id()));
         p.push("collection.json");
         p
     }

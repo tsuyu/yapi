@@ -17,12 +17,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1150.0, 800.0])
             .with_min_inner_size([820.0, 540.0])
-            .with_title("api-req"),
+            .with_title("yAPI"),
         ..Default::default()
     };
     eframe::run_native(
-        "api-req",
+        "yAPI",
         options,
-        Box::new(|cc| Ok(Box::new(app::ApiReqApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::YapiApp::new(cc)))),
     )
 }

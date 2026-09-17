@@ -289,7 +289,7 @@ pub fn client_with(
 ) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(opts.timeout_secs.max(1)))
-        .user_agent("api-req/0.1");
+        .user_agent("yAPI/0.1");
 
     builder = builder.redirect(if transport.follow_redirects {
         reqwest::redirect::Policy::limited(transport.max_redirects)
@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn multipart_sends_text_fields_and_files() {
-        let dir = std::env::temp_dir().join(format!("api-req-mp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("yapi-mp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hello.json");
         std::fs::write(&file, br#"{"from":"file"}"#).unwrap();
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn binary_body_sends_the_file_bytes() {
-        let dir = std::env::temp_dir().join(format!("api-req-bin-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("yapi-bin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("payload.xml");
         std::fs::write(&file, b"<note>hi</note>").unwrap();

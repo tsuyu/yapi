@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throwaway API for exercising api-req by hand.
+"""Throwaway API for exercising yAPI by hand.
 
     python dev-server.py            # http://localhost:8000
 
@@ -44,7 +44,7 @@ PNG = (
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "api-req-dev/1.0"
+    server_version = "yAPI-dev/1.0"
 
     # ---------------------------------------------------------------- utils
 
@@ -99,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             return self.reply(200, {
-                "server": "api-req dev server",
+                "server": "yAPI dev server",
                 "endpoints": [
                     "/echo", "/login", "/users/me", "/users/<id>", "/xml",
                     "/html", "/image", "/binary", "/big", "/cookies",
@@ -230,6 +230,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"api-req dev server on http://localhost:{PORT}  (ctrl+c to stop)")
+    print(f"yAPI dev server on http://localhost:{PORT}  (ctrl+c to stop)")
     print("try:  localhost:8000/echo?a=1")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

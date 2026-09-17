@@ -87,7 +87,7 @@ fn views_for(shape: Shape) -> Vec<BodyView> {
 /// How long the draft has to sit unchanged before it is written to disk.
 const DRAFT_AUTOSAVE_DELAY: Duration = Duration::from_millis(800);
 
-pub struct ApiReqApp {
+pub struct YapiApp {
     coll: Collection,
     path: PathBuf,
     session_path: PathBuf,
@@ -139,7 +139,7 @@ pub struct ApiReqApp {
     jwt_error: String,
 }
 
-impl ApiReqApp {
+impl YapiApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let path = store::default_path();
@@ -759,7 +759,7 @@ impl ApiReqApp {
             if ui.button("export").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("json", &["json"])
-                    .set_file_name("api-req-collection.json")
+                    .set_file_name("yAPI-collection.json")
                     .save_file()
                 {
                     match store::save(&p, &self.coll) {
@@ -2713,7 +2713,7 @@ fn kv_editor(ui: &mut egui::Ui, id: &str, rows: &mut Vec<KeyVal>) {
     }
 }
 
-impl eframe::App for ApiReqApp {
+impl eframe::App for YapiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain();
 

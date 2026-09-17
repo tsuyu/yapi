@@ -306,7 +306,7 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                     reply(&stream, "State mismatch. You can close this tab.");
                     return Err("state mismatch - redirect did not come from our request".to_owned());
                 }
-                reply(&stream, "Authorized. You can close this tab and go back to api-req.");
+                reply(&stream, "Authorized. You can close this tab and go back to yAPI.");
                 return Ok(code);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -322,7 +322,7 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
 
 fn reply(mut stream: &std::net::TcpStream, message: &str) {
     let body = format!(
-        "<!doctype html><meta charset=utf-8><title>api-req</title>\
+        "<!doctype html><meta charset=utf-8><title>yAPI</title>\
          <body style=\"font:16px system-ui;padding:3rem\">{message}</body>"
     );
     let _ = write!(

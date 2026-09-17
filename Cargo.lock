@@ -80,24 +80,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
-name = "api-req"
-version = "0.1.0"
-dependencies = [
- "directories",
- "eframe",
- "egui",
- "hmac",
- "image",
- "rand 0.8.7",
- "regex",
- "reqwest",
- "rfd",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4809,6 +4791,24 @@ name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "yapi"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "eframe",
+ "egui",
+ "hmac",
+ "image",
+ "rand 0.8.7",
+ "regex",
+ "reqwest",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "yoke"
