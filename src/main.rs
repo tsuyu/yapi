@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assertion;
 mod chain;
+mod codegen;
 mod curl;
 mod extract;
 mod jsonpath;

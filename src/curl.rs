@@ -587,6 +587,13 @@ pub fn generate(spec: &RequestSpec, insecure_tls: bool, timeout_secs: Option<u64
                 quote(&crate::model::urlencode_pairs(&pairs))
             ));
         }
+        BodyKind::GraphQl => {
+            // what goes on the wire is the envelope, not the bare query
+            lines.push(format!(
+                "--data-raw {}",
+                quote(&crate::model::graphql_body(&spec.body, &spec.graphql_vars))
+            ));
+        }
         _ => {
             if !spec.body.is_empty() {
                 lines.push(format!("--data-raw {}", quote(&spec.body)));

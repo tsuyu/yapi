@@ -42,6 +42,7 @@ kind or auth mode would have set.
 |---|---|
 | none | no body |
 | json | text editor, `format` pretty-prints, `application/json` |
+| graphql | query pane + variables pane, sent as `{"query": ..., "variables": ...}`, `application/json` |
 | xml | text editor, `application/xml` |
 | raw | text editor, `text/plain; charset=utf-8` |
 | x-www-form-urlencoded | one `key=value` per line, percent-encoded |
@@ -111,12 +112,31 @@ continuations (`\`, and `^` for cmd), single and double quotes, and
 `Authorization: Bearer …` header becomes a bearer credential rather than a
 header row, and `Basic` is decoded back into username and password.
 
-**Export** — `copy as curl` puts the command on the clipboard; `show curl` keeps
-a live window open while you edit. `{{variables}}` stay visible by default;
-tick `substitute {{variables}}` to bake in current values. Values are
-single-quoted the way curl's own copy-as does it, so `it's` survives.
+**Export** — `copy as curl` puts the command on the clipboard; `code` keeps a
+live window open while you edit. `{{variables}}` stay visible by default; tick
+`substitute {{variables}}` to bake in current values. Values are single-quoted
+the way curl's own copy-as does it, so `it's` survives.
 
 Generated commands parse back into the same request — there is a test for that.
+
+## Code generation
+
+The `code` window writes the open request in four languages, updating as you
+type:
+
+| target | notes |
+|---|---|
+| curl | the same generator the clipboard button uses |
+| javascript fetch | `fetch(url, {method, headers, body})`, `FormData` built above the call |
+| python requests | `requests.post(...)` with `headers` / `data` / `files` dicts, plus `timeout`, `verify` and `proxies` |
+| httpie | `http POST url 'Header:value'`; a raw body is piped in with `echo` |
+
+Auth, cookies and the body-kind `Content-Type` are folded into the headers the
+same way `net` does it, so an explicit header row still wins. Anything a target
+cannot express — a binary body, a file upload, a client certificate — is named
+in a comment rather than dropped silently.
+
+Only curl parses back in. The other three are one-way.
 
 ## Options tab
 
@@ -133,9 +153,23 @@ parts, auth fields — can contain `{{name}}`. Names resolve against the variabl
 store; an unknown name is left as written and flagged `unset:` under the url bar
 rather than sent as an empty string.
 
-Variables come from two places, both in the sidebar panel: defaults saved with
-the collection (`save as defaults` / `reset`), and values **extracted from
-responses**.
+Variables come from three places: defaults saved with the collection
+(`save as defaults` / `reset`), the active **environment**, and values
+**extracted from responses**.
+
+### Environments
+
+A named set of values — dev, staging, prod — layered over the collection
+defaults. The `env` picker in the sidebar switches between them; `edit` opens
+the list to add, rename, copy or delete one.
+
+Only the names that differ need to be in an environment. A name it does not
+mention falls through to the collection default, so `{{base}}` can change per
+environment while `{{api_version}}` stays in one place. Switching keeps
+anything extracted since the last send, but an environment value wins over one
+extracted under the same name — picking `prod` never leaves a dev token behind.
+
+The active environment is saved with the collection.
 
 ### Extraction
 
@@ -153,6 +187,33 @@ The `extract` tab on any request pulls values out of its response:
 Rules run after every send, single request or chain, so a value is available to
 the next request immediately. A rule that cannot be applied reports itself and
 does not stop the others. The tab shows each variable's current value.
+
+### Checks
+
+The `checks` tab asserts what the response should look like. Rules run after
+every send, on their own and inside a chain:
+
+| check | expression | compares |
+|---|---|---|
+| status | — | the status code |
+| jsonpath | `$.data.id` | the first match |
+| header | `Content-Type` | that response header |
+| cookie | `session` | that `Set-Cookie` value |
+| body | — | the whole body |
+| elapsed ms | — | how long it took |
+
+Operators: `==`, `!=`, `contains`, `does not contain`, `matches` (regex), `<`,
+`>`, `exists`, `is absent`. The expected value can itself be a `{{variable}}`.
+
+A failing check marks the response wrong without hiding it — the body is still
+there to look at. The tab header carries the verdict (`checks (2/3)`) and
+highlights on a failure, so you do not have to open it to know. A rule that
+cannot run — a jsonpath against a non-json body, a bad regex — counts as a
+failure rather than passing quietly.
+
+In a chain, a step whose checks fail stops the run exactly as a 5xx does,
+unless that step has `keep going on failure` ticked. That is the difference
+between a chain and a test.
 
 ### Chains
 
@@ -210,6 +271,11 @@ from it:
   click to copy them into the request cookies tab.
 - **save body...** writes the raw bytes to a file, guessing a name from the url.
 
+While a request is in flight the send button is replaced by `cancel` and a
+running counter. Cancelling unsticks the UI immediately and discards whatever
+comes back; the connection itself closes when the server answers or the timeout
+fires, since the blocking HTTP call underneath has no abort.
+
 Failures come back with the reqwest error chain plus the hint that usually
 applies: connection refused on loopback asks whether the dev server is up, a
 cert failure points at `insecure tls`, a dns failure suggests `127.0.0.1` over
@@ -221,11 +287,35 @@ Requests to loopback bypass any system or corporate proxy. `insecure tls` in the
 top bar skips certificate checks for a local https server with a self-signed
 cert — it disables validation entirely, so keep it for servers you run.
 
+## Organising the sidebar
+
+**Filter** — the box above the list narrows it by name, method, url or folder
+as you type.
+
+**Folders** — the picker next to the request name files it under a folder;
+`+ new folder` in that list makes one. A request names its folder rather than
+living inside it, so moving one is a single edit and renaming a folder never
+orphans anything. Folders collapse with a click; requests with no folder sit at
+the bottom.
+
+## History
+
+`history` in the top bar keeps the last 50 sends with their responses. Each row
+shows the method, status, time, size and — where the request had checks — how
+many passed. `open` puts that request and its response back without sending
+anything; `send again` loads it and fires.
+
+Failed sends are in there too, with the error, so a request that never got a
+response is still recoverable.
+
+History lives in memory only. It is gone when the app closes, and nothing about
+it is written to disk.
+
 ## Saving
 
 - `save` / `ctrl+s` writes the open request into the sidebar collection: url,
   method, query, path params, headers, cookies, body (including file paths and
-  multipart parts), and the full auth config.
+  multipart parts), checks, folder, and the full auth config.
 - Draft autosave: whatever is in the editor right now, plus the timeout and
   which entry is open, plus the current variables, is written ~0.8s after you stop typing and again on exit,
   then restored next launch. Closing the window never loses typed input. The top
@@ -233,11 +323,33 @@ cert — it disables validation entirely, so keep it for servers you run.
 - `import` appends another collection file; `export` writes the whole collection
   anywhere.
 
+### Credentials on disk
+
+Tokens, passwords, client secrets and JWT signing keys are stored in
+`collection.json` and `session.json` as plain text, the way most API clients do
+it. Locally that is what makes the app work across restarts. It matters when
+the file moves.
+
+So `export` asks. If the collection holds any credential it lists what is
+there and offers two buttons:
+
+- **export without secrets** — urls, headers, bodies, checks, folders, client
+  ids, grant settings and variable *names* are kept; every secret and every
+  variable *value* is blanked. Safe to send to someone else or commit.
+- **export everything** — a full backup. Treat that file as a password.
+
+An export from a collection with no credentials in it skips the question.
+
 Files, side by side:
 
 - Windows: `%APPDATA%\yAPI\config\collection.json` + `session.json`
 - Linux: `~/.config/yAPI/`
 - macOS: `~/Library/Application Support/yAPI/`
+
+This app used to be called `api-req`. On first launch, if the yAPI directory
+has no collection yet and the old `api-req` one does, both files are copied
+across and a toast says so. It runs once: after that the yAPI files are the
+only ones read, and deleting one keeps it deleted.
 
 A missing or corrupt file of either kind falls back to defaults rather than
 failing to start.

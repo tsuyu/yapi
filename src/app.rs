@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText};
 
 use crate::chain::{self, ChainMsg};
+use crate::assertion;
+use crate::codegen::{self, Target};
 use crate::model::{
-    ApiKeyIn, AuthKind, BodyKind, Chain, ChainStep, ClientAuth, Collection, Extract, ExtractFrom,
-    FormPart, Grant, KeyVal, Method, RequestSpec,
+    ApiKeyIn, AssertOn, AssertOp, Assertion, AuthKind, BodyKind, Chain, ChainStep, ClientAuth,
+    Collection, Environment, Extract, ExtractFrom, FormPart, Grant, KeyVal, Method, RequestSpec,
 };
 use crate::oauth::{self, TokenMsg};
 use crate::net::{self, Msg, ResponseData, SendOpts, Shape};
@@ -23,6 +25,7 @@ enum Tab {
     Auth,
     Body,
     Extract,
+    Assert,
     Options,
 }
 
@@ -111,6 +114,11 @@ pub struct YapiApp {
     timeout_secs: u64,
     insecure_tls: bool,
     inflight: bool,
+    /// Which send we are waiting for. Cancelling bumps it, so the worker's
+    /// eventual result arrives stamped with an old number and is dropped.
+    send_seq: u64,
+    /// When the in-flight request started, for the elapsed counter.
+    sent_at: Option<Instant>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     resp: Option<ResponseData>,
@@ -128,6 +136,8 @@ pub struct YapiApp {
     chain_running: bool,
     chain_log: Vec<ChainLog>,
     new_var: String,
+    /// Which language the code window is showing.
+    code_target: Target,
     curl_window: bool,
     curl_import_window: bool,
     curl_import_text: String,
@@ -137,11 +147,56 @@ pub struct YapiApp {
     oauth_status: String,
     oauth_raw: Option<String>,
     jwt_error: String,
+    /// Results of the assertions on the last response.
+    assert_results: Vec<assertion::Check>,
+    /// Recent sends, newest first, capped at `HISTORY_LIMIT`.
+    history: Vec<HistoryEntry>,
+    history_window: bool,
+    /// Sidebar filter over saved request names, methods and urls.
+    req_filter: String,
+    /// Collapsed folders in the sidebar, by name.
+    collapsed_folders: Vec<String>,
+    /// Folder the "move to" combo is about to assign.
+    new_folder: String,
+    env_window: bool,
+    /// What an export would strip, shown before it is written.
+    export_confirm: Option<ExportConfirm>,
 }
+
+/// One past send, kept in memory so a response can be brought back after the
+/// editor has moved on. Bodies are truncated: this is for "what did I just
+/// send", not an archive.
+struct HistoryEntry {
+    at: std::time::SystemTime,
+    spec: RequestSpec,
+    method: Method,
+    url: String,
+    status: u16,
+    elapsed_ms: u128,
+    size: usize,
+    /// `None` when the send failed before a response arrived.
+    resp: Option<Box<ResponseData>>,
+    error: String,
+    /// Passed / total, when the request had assertions.
+    checks: Option<(usize, usize)>,
+}
+
+/// A pending export, waiting on the secrets question.
+struct ExportConfirm {
+    path: PathBuf,
+    secrets: Vec<String>,
+}
+
+/// How many past sends to keep. Enough to cover a debugging session, small
+/// enough that the bodies do not add up to anything.
+const HISTORY_LIMIT: usize = 50;
 
 impl YapiApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // a collection written before the rename still lives under the old
+        // directory; bring it across once, before anything reads from disk
+        let migrated = store::migrate_legacy_config();
         let path = store::default_path();
         let coll = store::load(&path);
         let session_path = store::session_path();
@@ -168,12 +223,7 @@ impl YapiApp {
         let (tx, rx) = channel();
         let (token_tx, token_rx) = channel();
         let (chain_tx, chain_rx) = channel();
-        let defaults: BTreeMap<String, String> = coll
-            .variables
-            .iter()
-            .filter(|v| v.active())
-            .map(|v| (v.key.trim().to_owned(), v.value.clone()))
-            .collect();
+        let defaults = coll.resolved_vars();
         // anything extracted before the app closed is still useful now
         let vars = match &session_vars {
             Some(saved) if !saved.is_empty() => {
@@ -195,6 +245,7 @@ impl YapiApp {
             chain_running: false,
             chain_log: Vec::new(),
             new_var: String::new(),
+            code_target: Target::Curl,
             curl_window: false,
             curl_import_window: false,
             curl_import_text: String::new(),
@@ -225,12 +276,93 @@ impl YapiApp {
             timeout_secs,
             insecure_tls,
             inflight: false,
+            send_seq: 0,
+            sent_at: None,
             tx,
             rx,
             resp: None,
             error: None,
-            toast: String::new(),
+            toast: if migrated.is_empty() {
+                String::new()
+            } else {
+                format!("brought {} across from the old api-req folder", migrated.join(" and "))
+            },
+            assert_results: Vec::new(),
+            history: Vec::new(),
+            history_window: false,
+            req_filter: String::new(),
+            collapsed_folders: Vec::new(),
+            new_folder: String::new(),
+            env_window: false,
+            export_confirm: None,
         }
+    }
+
+    /// Base variables plus the active environment, as a fresh start. Extracted
+    /// values are not in here - they layer on at runtime.
+    fn env_vars(&self) -> BTreeMap<String, String> {
+        self.coll.resolved_vars()
+    }
+
+    /// Switch environment, keeping anything extracted since the last send.
+    /// Environment values win: picking "prod" should not leave a dev token in
+    /// place under the same name.
+    fn use_env(&mut self, index: Option<usize>) {
+        self.coll.active_env = index;
+        let env = self.env_vars();
+        for (k, v) in env {
+            self.vars.insert(k, v);
+        }
+        self.persist();
+        self.toast = format!("environment: {}", self.coll.active_env_name());
+    }
+
+    /// Record a send. Called for both a real response and a transport failure,
+    /// so the log shows the attempt either way.
+    fn push_history(&mut self, resp: &ResponseData) {
+        let checks = if self.assert_results.is_empty() {
+            None
+        } else {
+            Some((
+                self.assert_results.iter().filter(|c| c.passed).count(),
+                self.assert_results.len(),
+            ))
+        };
+        self.history.insert(
+            0,
+            HistoryEntry {
+                at: std::time::SystemTime::now(),
+                spec: self.cur.clone(),
+                method: self.cur.method,
+                url: resp.final_url.clone(),
+                status: resp.status,
+                elapsed_ms: resp.elapsed_ms,
+                size: resp.size,
+                resp: Some(Box::new(resp.clone())),
+                error: String::new(),
+                checks,
+            },
+        );
+        self.history.truncate(HISTORY_LIMIT);
+    }
+
+    fn push_history_failure(&mut self, error: &str) {
+        self.history.insert(
+            0,
+            HistoryEntry {
+                at: std::time::SystemTime::now(),
+                spec: self.cur.clone(),
+                method: self.cur.method,
+                url: self.cur.resolve(&self.vars).full_url(),
+                status: 0,
+                elapsed_ms: 0,
+                size: 0,
+                resp: None,
+                error: error.to_owned(),
+                checks: None,
+            },
+        );
+        self.history.truncate(HISTORY_LIMIT);
     }
 
     /// Write the draft (url, params, headers, auth, body) + ui state to disk.
@@ -262,34 +394,49 @@ impl YapiApp {
 
     /// This request as a curl command line.
     fn as_curl(&self) -> String {
+        self.as_code(Target::Curl)
+    }
+
+    /// This request rendered for `target`, honouring the substitute-variables
+    /// toggle shared by the code window and the copy buttons.
+    fn as_code(&self, target: Target) -> String {
         let spec = if self.curl_resolve_vars {
             self.cur.resolve(&self.vars)
         } else {
             self.cur.clone()
         };
-        crate::curl::generate(&spec, self.insecure_tls, Some(self.timeout_secs))
+        codegen::generate(target, &spec, self.insecure_tls, Some(self.timeout_secs))
     }
 
     fn curl_windows(&mut self, ctx: &egui::Context) {
         let mut open = self.curl_window;
-        egui::Window::new("curl")
+        let mut copied = String::new();
+        egui::Window::new("code")
             .open(&mut open)
             .resizable(true)
-            .default_width(640.0)
+            .default_width(680.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for target in Target::ALL {
+                        ui.selectable_value(&mut self.code_target, target, target.as_str());
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.curl_resolve_vars, "substitute {{variables}}");
                     if ui.button("copy").clicked() {
-                        let command = self.as_curl();
-                        ui.ctx().copy_text(command);
-                        self.toast = "copied as curl".to_owned();
+                        copied = self.code_target.as_str().to_owned();
+                        let code = self.as_code(self.code_target);
+                        ui.ctx().copy_text(code);
+                    }
+                    if self.code_target != Target::Curl {
+                        ui.weak("one way - only curl parses back in");
                     }
                 });
                 ui.separator();
-                let command = self.as_curl();
-                let mut text = command.as_str();
+                let code = self.as_code(self.code_target);
+                let mut text = code.as_str();
                 egui::ScrollArea::vertical()
-                    .max_height(360.0)
+                    .max_height(400.0)
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut text)
@@ -299,6 +446,9 @@ impl YapiApp {
                     });
             });
         self.curl_window = open;
+        if !copied.is_empty() {
+            self.toast = format!("copied as {copied}");
+        }
 
         let mut import_open = self.curl_import_window;
         let mut do_import = false;
@@ -475,10 +625,31 @@ impl YapiApp {
             }
         }
         self.inflight = true;
+        self.send_seq += 1;
+        self.sent_at = Some(Instant::now());
         self.error = None;
         self.toast.clear();
         let resolved = self.cur.resolve(&self.vars);
-        net::spawn(resolved, self.send_opts(), self.tx.clone(), ctx.clone());
+        net::spawn(
+            resolved,
+            self.send_opts(),
+            self.send_seq,
+            self.tx.clone(),
+            ctx.clone(),
+        );
+    }
+
+    /// Stop waiting on the in-flight request. The worker thread runs on until
+    /// the server answers or the timeout fires, but its result no longer
+    /// matches `send_seq` and is discarded on arrival.
+    fn cancel_send(&mut self) {
+        if !self.inflight {
+            return;
+        }
+        self.send_seq += 1;
+        self.inflight = false;
+        self.sent_at = None;
+        self.toast = "cancelled - the connection closes on timeout".to_owned();
     }
 
     fn send_opts(&self) -> SendOpts {
@@ -503,20 +674,28 @@ impl YapiApp {
                     elapsed_ms,
                     extracted,
                     warnings,
+                    checks,
+                    failed_checks,
                 } => {
                     for (k, v) in &extracted {
                         self.vars.insert(k.clone(), v.clone());
                     }
                     let mut detail = format!("{status} in {elapsed_ms} ms");
+                    if let Some((passed, total)) = checks {
+                        detail.push_str(&format!("  -  {passed}/{total} checks"));
+                    }
                     if !extracted.is_empty() {
                         let names: Vec<&str> =
                             extracted.iter().map(|(k, _)| k.as_str()).collect();
                         detail.push_str(&format!("  ->  {}", names.join(", ")));
                     }
+                    if !failed_checks.is_empty() {
+                        detail.push_str(&format!("  FAILED: {}", failed_checks.join("; ")));
+                    }
                     if !warnings.is_empty() {
                         detail.push_str(&format!("  ({})", warnings.join("; ")));
                     }
-                    let color = if status < 400 {
+                    let color = if status < 400 && failed_checks.is_empty() {
                         Color32::from_rgb(0x4c, 0xaf, 0x50)
                     } else {
                         Color32::from_rgb(0xef, 0x53, 0x50)
@@ -631,9 +810,14 @@ impl YapiApp {
         }
 
         while let Ok(msg) = self.rx.try_recv() {
+            // a result for a send that has since been cancelled or superseded
+            if msg.seq() != self.send_seq {
+                continue;
+            }
             self.inflight = false;
+            self.sent_at = None;
             match msg {
-                Msg::Done(r) => {
+                Msg::Done { resp: r, .. } => {
                     // whatever this response teaches us is available to the next request
                     let out = crate::extract::apply(&self.cur.extract, &r);
                     if !out.values.is_empty() {
@@ -647,6 +831,12 @@ impl YapiApp {
                     if !out.errors.is_empty() {
                         self.toast = format!("extract: {}", out.errors.join("; "));
                     }
+                    let checks = crate::assertion::apply(&self.cur.assertions, &r);
+                    if let Some(line) = checks.summary() {
+                        self.toast = line;
+                    }
+                    self.assert_results = checks.results;
+                    self.push_history(&r);
                     self.body_view = views_for(r.shape)[0];
                     self.resp = Some(*r);
                     self.resp_tab = RespTab::Body;
@@ -654,9 +844,11 @@ impl YapiApp {
                     self.image = None;
                     self.resp_seq += 1;
                 }
-                Msg::Failed(e) => {
+                Msg::Failed { error, .. } => {
                     self.resp = None;
-                    self.error = Some(e);
+                    self.assert_results.clear();
+                    self.push_history_failure(&error);
+                    self.error = Some(error);
                 }
             }
         }
@@ -699,26 +891,73 @@ impl YapiApp {
 
         ui.separator();
 
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.req_filter)
+                    .desired_width(ui.available_width() - 26.0)
+                    .hint_text("filter (name, method, url)"),
+            );
+            if ui.small_button("x").clicked() {
+                self.req_filter.clear();
+            }
+        });
+
+        ui.separator();
+
+        // indices that survive the filter, grouped by folder; the real index is
+        // carried through so selecting and deleting stay correct
+        let needle = self.req_filter.trim().to_lowercase();
+        let matching: Vec<usize> = (0..self.coll.requests.len())
+            .filter(|i| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let r = &self.coll.requests[*i];
+                r.name.to_lowercase().contains(&needle)
+                    || r.url.to_lowercase().contains(&needle)
+                    || r.method.as_str().to_lowercase().contains(&needle)
+                    || r.folder.to_lowercase().contains(&needle)
+            })
+            .collect();
+
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        for name in self.coll.folder_names() {
+            let members: Vec<usize> = matching
+                .iter()
+                .copied()
+                .filter(|i| self.coll.requests[*i].folder.trim() == name)
+                .collect();
+            if !members.is_empty() || needle.is_empty() {
+                groups.push((name, members));
+            }
+        }
+        let loose: Vec<usize> = matching
+            .iter()
+            .copied()
+            .filter(|i| self.coll.requests[*i].folder.trim().is_empty())
+            .collect();
+
         let mut delete: Option<usize> = None;
+        let mut open: Option<usize> = None;
+        let mut toggle_folder: Option<String> = None;
         let list_height = (ui.available_height() - 64.0).max(80.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .max_height(list_height)
             .show(ui, |ui| {
-                for i in 0..self.coll.requests.len() {
-                    let r = &self.coll.requests[i];
+                let requests = &self.coll.requests;
+                let selected = self.selected;
+                let mut row = |ui: &mut egui::Ui, i: usize, indent: f32| {
+                    let r = &requests[i];
                     let label = format!("{}  {}", r.method.as_str(), r.name);
                     let color = r.method.color();
                     ui.horizontal(|ui| {
+                        ui.add_space(indent);
                         if ui
-                            .selectable_label(
-                                self.selected == Some(i),
-                                RichText::new(label).color(color),
-                            )
+                            .selectable_label(selected == Some(i), RichText::new(label).color(color))
                             .clicked()
                         {
-                            self.selected = Some(i);
-                            self.cur = self.coll.requests[i].clone();
+                            open = Some(i);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("x").clicked() {
@@ -726,11 +965,50 @@ impl YapiApp {
                             }
                         });
                     });
+                };
+
+                for (name, members) in &groups {
+                    let collapsed = self.collapsed_folders.iter().any(|f| f == name);
+                    let arrow = if collapsed { ">" } else { "v" };
+                    if ui
+                        .small_button(format!("{arrow}  {name}  ({})", members.len()))
+                        .clicked()
+                    {
+                        toggle_folder = Some(name.clone());
+                    }
+                    if !collapsed {
+                        for i in members {
+                            row(ui, *i, 12.0);
+                        }
+                    }
                 }
-                if self.coll.requests.is_empty() {
+                if !groups.is_empty() && !loose.is_empty() {
+                    ui.add_space(2.0);
+                }
+                for i in &loose {
+                    row(ui, *i, 0.0);
+                }
+
+                if requests.is_empty() {
                     ui.weak("nothing saved yet");
+                } else if matching.is_empty() {
+                    ui.weak(format!("nothing matches \"{}\"", needle));
                 }
             });
+
+        if let Some(i) = open {
+            self.selected = Some(i);
+            self.cur = self.coll.requests[i].clone();
+            self.assert_results.clear();
+        }
+        if let Some(name) = toggle_folder {
+            match self.collapsed_folders.iter().position(|f| f == &name) {
+                Some(at) => {
+                    self.collapsed_folders.remove(at);
+                }
+                None => self.collapsed_folders.push(name),
+            }
+        }
 
         if let Some(i) = delete {
             self.coll.requests.remove(i);
@@ -762,16 +1040,390 @@ impl YapiApp {
                     .set_file_name("yAPI-collection.json")
                     .save_file()
                 {
-                    match store::save(&p, &self.coll) {
-                        Ok(()) => self.toast = format!("exported -> {}", p.display()),
-                        Err(e) => self.toast = format!("export failed: {e}"),
+                    // credentials live in this file in the clear, so an export
+                    // that leaves the machine asks first
+                    let secrets = self.coll.secrets_summary();
+                    if secrets.is_empty() {
+                        self.write_export(&p, false);
+                    } else {
+                        self.export_confirm = Some(ExportConfirm { path: p, secrets });
                     }
                 }
             }
         });
         ui.weak(RichText::new(self.path.display().to_string()).size(9.0));
         ui.separator();
+        self.environment_bar(ui);
         self.variables_panel(ui);
+    }
+
+    fn write_export(&mut self, path: &std::path::Path, scrubbed: bool) {
+        let coll = if scrubbed {
+            self.coll.scrubbed()
+        } else {
+            self.coll.clone()
+        };
+        match store::save(path, &coll) {
+            Ok(()) => {
+                self.toast = if scrubbed {
+                    format!("exported without secrets -> {}", path.display())
+                } else {
+                    format!("exported -> {}", path.display())
+                }
+            }
+            Err(e) => self.toast = format!("export failed: {e}"),
+        }
+    }
+
+    /// Asked before an export that would carry credentials off this machine.
+    fn export_window(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.export_confirm else {
+            return;
+        };
+        let path = pending.path.clone();
+        let secrets = pending.secrets.clone();
+        let mut decision: Option<bool> = None;
+        let mut dismiss = false;
+        let mut open = true;
+
+        egui::Window::new("export: this collection holds credentials")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("These are stored in the file as plain text:");
+                egui::ScrollArea::vertical()
+                    .id_salt("export_secrets")
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for line in &secrets {
+                            ui.weak(format!("  - {line}"));
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.weak(
+                    "Urls, headers, bodies, client ids and grant settings are kept either way - only the secrets differ.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("export without secrets")
+                        .on_hover_text("safe to send to someone else")
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui
+                        .button("export everything")
+                        .on_hover_text("a full backup - treat the file as a password")
+                        .clicked()
+                    {
+                        decision = Some(false);
+                    }
+                    if ui.button("cancel").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if let Some(scrubbed) = decision {
+            self.write_export(&path, scrubbed);
+            self.export_confirm = None;
+        } else if dismiss || !open {
+            self.export_confirm = None;
+        }
+    }
+
+    /// The last 50 sends. Clicking one puts its request back in the editor and
+    /// its response back in the viewer, without re-sending anything.
+    fn history_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.history_window;
+        let mut restore: Option<usize> = None;
+        let mut replay: Option<usize> = None;
+        let mut clear = false;
+
+        egui::Window::new("history")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(760.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak(format!(
+                        "{} of {HISTORY_LIMIT} kept, newest first - this is memory only, \
+                         nothing is written to disk",
+                        self.history.len()
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("clear").clicked() {
+                            clear = true;
+                        }
+                    });
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("history_list")
+                    .max_height(460.0)
+                    .show(ui, |ui| {
+                        for (i, h) in self.history.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(h.method.as_str())
+                                        .color(h.method.color())
+                                        .monospace(),
+                                );
+                                if h.resp.is_some() {
+                                    let color = if h.status < 400 {
+                                        Color32::from_rgb(0x4c, 0xaf, 0x50)
+                                    } else {
+                                        Color32::from_rgb(0xef, 0x53, 0x50)
+                                    };
+                                    ui.colored_label(color, h.status.to_string());
+                                } else {
+                                    ui.colored_label(
+                                        Color32::from_rgb(0xef, 0x53, 0x50),
+                                        "failed",
+                                    );
+                                }
+                                ui.weak(format!("{} ms", h.elapsed_ms));
+                                ui.weak(crate::pretty::human_size(h.size));
+                                if let Some((passed, total)) = h.checks {
+                                    let color = if passed == total {
+                                        Color32::from_rgb(0x4c, 0xaf, 0x50)
+                                    } else {
+                                        Color32::from_rgb(0xef, 0x53, 0x50)
+                                    };
+                                    ui.colored_label(color, format!("{passed}/{total}"));
+                                }
+                                ui.weak(ago(h.at));
+                                if ui
+                                    .small_button("open")
+                                    .on_hover_text("put this request and response back")
+                                    .clicked()
+                                {
+                                    restore = Some(i);
+                                }
+                                if ui
+                                    .small_button("send again")
+                                    .on_hover_text("load it and fire it")
+                                    .clicked()
+                                {
+                                    replay = Some(i);
+                                }
+                            });
+                            let detail = if h.error.is_empty() {
+                                truncate(&h.url, 110)
+                            } else {
+                                format!("{}  -  {}", truncate(&h.url, 70), truncate(&h.error, 60))
+                            };
+                            ui.weak(RichText::new(detail).size(10.0));
+                            ui.separator();
+                        }
+                        if self.history.is_empty() {
+                            ui.weak("nothing sent yet this session");
+                        }
+                    });
+            });
+
+        self.history_window = open;
+        if clear {
+            self.history.clear();
+        }
+        if let Some(i) = restore.or(replay) {
+            if let Some(h) = self.history.get(i) {
+                self.cur = h.spec.clone();
+                self.mode = Mode::Request;
+                self.selected = self
+                    .coll
+                    .requests
+                    .iter()
+                    .position(|r| r.name == self.cur.name);
+                self.assert_results.clear();
+                self.jsonpath_result = None;
+                self.image = None;
+                self.resp_seq += 1;
+                match (&h.resp, h.error.clone()) {
+                    (Some(resp), _) => {
+                        self.body_view = views_for(resp.shape)[0];
+                        self.resp = Some((**resp).clone());
+                        self.resp_tab = RespTab::Body;
+                        self.error = None;
+                    }
+                    (None, error) => {
+                        self.resp = None;
+                        self.error = Some(error);
+                    }
+                }
+                self.toast = "loaded from history".to_owned();
+            }
+            if replay.is_some() {
+                self.history_window = false;
+                self.send(ctx);
+            }
+        }
+    }
+
+    /// Named variable sets, and which one is live.
+    fn environment_bar(&mut self, ui: &mut egui::Ui) {
+        let names: Vec<String> = self
+            .coll
+            .environments
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let mut pick: Option<Option<usize>> = None;
+        ui.horizontal(|ui| {
+            ui.label("env");
+            egui::ComboBox::from_id_salt("env_pick")
+                .width(140.0)
+                .selected_text(self.coll.active_env_name())
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.coll.active_env.is_none(), "no environment")
+                        .clicked()
+                    {
+                        pick = Some(None);
+                    }
+                    for (i, name) in names.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.coll.active_env == Some(i), name)
+                            .clicked()
+                        {
+                            pick = Some(Some(i));
+                        }
+                    }
+                });
+            if ui.small_button("edit").clicked() {
+                self.env_window = true;
+            }
+        });
+        if let Some(index) = pick {
+            self.use_env(index);
+        }
+    }
+
+    /// Editor for the environment list: add, rename, set values, delete.
+    fn env_editor_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.env_window;
+        let mut dirty = false;
+        let mut activate: Option<Option<usize>> = None;
+        let mut remove: Option<usize> = None;
+        let active = self.coll.active_env;
+
+        egui::Window::new("environments")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.weak(
+                    "Each environment is a set of {{variable}} values layered over the collection defaults. Only the names that differ need to be here.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("+ environment").clicked() {
+                        self.coll.environments.push(Environment::default());
+                        activate = Some(Some(self.coll.environments.len() - 1));
+                        dirty = true;
+                    }
+                    if ui.button("copy active").clicked() {
+                        if let Some(src) = active.and_then(|i| self.coll.environments.get(i)) {
+                            let copy = Environment {
+                                name: format!("{} copy", src.name),
+                                vars: src.vars.clone(),
+                            };
+                            self.coll.environments.push(copy);
+                            activate = Some(Some(self.coll.environments.len() - 1));
+                            dirty = true;
+                        }
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("env_list")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        for (i, env) in self.coll.environments.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.radio(active == Some(i), "").clicked() {
+                                    activate = Some(Some(i));
+                                }
+                                dirty |= ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut env.name)
+                                            .desired_width(200.0),
+                                    )
+                                    .changed();
+                                if ui.small_button("delete").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+
+                            let mut drop_row: Option<usize> = None;
+                            egui::Grid::new(("env_vars", i))
+                                .num_columns(4)
+                                .striped(true)
+                                .spacing([6.0, 3.0])
+                                .show(ui, |ui| {
+                                    for (j, kv) in env.vars.iter_mut().enumerate() {
+                                        dirty |= ui.checkbox(&mut kv.on, "").changed();
+                                        dirty |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut kv.key)
+                                                    .desired_width(150.0)
+                                                    .hint_text("name"),
+                                            )
+                                            .changed();
+                                        dirty |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut kv.value)
+                                                    .desired_width(240.0)
+                                                    .hint_text("value")
+                                                    .font(egui::TextStyle::Monospace),
+                                            )
+                                            .changed();
+                                        if ui.small_button("x").clicked() {
+                                            drop_row = Some(j);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            if let Some(j) = drop_row {
+                                env.vars.remove(j);
+                                dirty = true;
+                            }
+                            if ui.small_button("+ value").clicked() {
+                                env.vars.push(KeyVal::default());
+                                dirty = true;
+                            }
+                            ui.separator();
+                        }
+                        if self.coll.environments.is_empty() {
+                            ui.weak("none yet - add one to keep dev and prod apart");
+                        }
+                    });
+            });
+
+        self.env_window = open;
+        if let Some(i) = remove {
+            self.coll.environments.remove(i);
+            self.coll.active_env = match self.coll.active_env {
+                Some(a) if a == i => None,
+                Some(a) if a > i => Some(a - 1),
+                other => other,
+            };
+            dirty = true;
+        }
+        if let Some(index) = activate {
+            self.use_env(index);
+        } else if dirty {
+            self.persist();
+            // a value the live environment sets should take effect as it is typed
+            let env = self.env_vars();
+            for (k, v) in env {
+                self.vars.insert(k, v);
+            }
+        }
     }
 
     /// Current `{{name}}` values: collection defaults plus anything extracted.
@@ -1039,9 +1691,51 @@ impl YapiApp {
             ui.label("name");
             ui.add(
                 egui::TextEdit::singleline(&mut self.cur.name)
-                    .desired_width(240.0)
+                    .desired_width(220.0)
                     .hint_text("request name"),
             );
+            let folders = self.coll.folder_names();
+            egui::ComboBox::from_id_salt("folder_pick")
+                .width(130.0)
+                .selected_text(if self.cur.folder.trim().is_empty() {
+                    "no folder".to_owned()
+                } else {
+                    self.cur.folder.clone()
+                })
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.cur.folder.trim().is_empty(), "no folder")
+                        .clicked()
+                    {
+                        self.cur.folder.clear();
+                    }
+                    for name in &folders {
+                        if ui
+                            .selectable_label(&self.cur.folder == name, name)
+                            .clicked()
+                        {
+                            self.cur.folder = name.clone();
+                        }
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_folder)
+                                .desired_width(110.0)
+                                .hint_text("new folder"),
+                        );
+                        if ui.small_button("+").clicked() {
+                            let name = self.new_folder.trim().to_owned();
+                            if !name.is_empty() {
+                                if !self.coll.folders.iter().any(|f| f == &name) {
+                                    self.coll.folders.push(name.clone());
+                                }
+                                self.cur.folder = name;
+                                self.new_folder.clear();
+                            }
+                        }
+                    });
+                });
             if let Some(warning) = self.credential_warning() {
                 ui.colored_label(Color32::from_rgb(0xff, 0xa7, 0x26), warning)
                     .on_hover_text("check the auth tab before sending");
@@ -1082,8 +1776,15 @@ impl YapiApp {
                 ui.ctx().copy_text(command);
                 self.toast = "copied as curl".to_owned();
             }
-            if ui.button("show curl").clicked() {
+            if ui.button("code").on_hover_text("curl, fetch, python or httpie").clicked() {
                 self.curl_window = true;
+            }
+            if ui
+                .button(format!("history ({})", self.history.len()))
+                .on_hover_text("the last 50 sends, with their responses")
+                .clicked()
+            {
+                self.history_window = true;
             }
             ui.separator();
             ui.checkbox(&mut self.insecure_tls, "insecure tls")
@@ -1118,6 +1819,20 @@ impl YapiApp {
                 .clicked()
             {
                 self.send(ctx);
+            }
+            if self.inflight {
+                if ui
+                    .button("cancel")
+                    .on_hover_text("stop waiting - the request itself ends at the timeout")
+                    .clicked()
+                {
+                    self.cancel_send();
+                }
+                if let Some(started) = self.sent_at {
+                    ui.weak(format!("{:.1}s", started.elapsed().as_secs_f32()));
+                    // keep the counter moving while nothing else asks for a frame
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
             }
 
             ui.add(
@@ -1200,6 +1915,22 @@ impl YapiApp {
             );
             let n_extract = self.cur.extract.iter().filter(|e| e.active()).count();
             ui.selectable_value(&mut self.tab, Tab::Extract, format!("extract ({n_extract})"));
+            let n_assert = self.cur.assertions.iter().filter(|a| a.active()).count();
+            // the tab header carries the last run's verdict, so a failure is
+            // visible without opening it
+            let assert_label = match (n_assert, self.assert_results.is_empty()) {
+                (0, _) => "checks".to_owned(),
+                (_, true) => format!("checks ({n_assert})"),
+                _ => format!(
+                    "checks ({}/{})",
+                    self.assert_results.iter().filter(|c| c.passed).count(),
+                    self.assert_results.len()
+                ),
+            };
+            let assert_tab = ui.selectable_value(&mut self.tab, Tab::Assert, assert_label);
+            if !self.assert_results.is_empty() && self.assert_results.iter().any(|c| !c.passed) {
+                assert_tab.highlight();
+            }
             ui.selectable_value(&mut self.tab, Tab::Options, "options".to_owned());
         });
         ui.separator();
@@ -1529,6 +2260,14 @@ impl YapiApp {
                     ui.add_space(4.0);
                     extract_editor(ui, &mut self.cur.extract, &self.vars);
                 }
+                Tab::Assert => {
+                    ui.weak(
+                        "checks run after every send, here and in a chain - a failing check \
+                         marks the response wrong without hiding it",
+                    );
+                    ui.add_space(4.0);
+                    assert_editor(ui, &mut self.cur.assertions, &self.assert_results);
+                }
                 Tab::Body => {
                     ui.horizontal_wrapped(|ui| {
                         for k in BodyKind::ALL {
@@ -1607,7 +2346,40 @@ impl YapiApp {
                         _ => {}
                     }
 
-                    if self.cur.body_kind.is_text() || self.cur.body_kind == BodyKind::Form {
+                    if self.cur.body_kind == BodyKind::GraphQl {
+                        ui.weak("query");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.cur.body)
+                                .code_editor()
+                                .desired_rows(10)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("query Me { viewer { id name } }"),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.weak("variables (json)");
+                            let bad = !self.cur.graphql_vars.trim().is_empty()
+                                && serde_json::from_str::<serde_json::Value>(
+                                    &self.cur.graphql_vars,
+                                )
+                                .is_err();
+                            if bad {
+                                ui.colored_label(
+                                    Color32::from_rgb(0xff, 0xa7, 0x26),
+                                    "not valid json - sent as {}",
+                                );
+                            }
+                        });
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.cur.graphql_vars)
+                                .code_editor()
+                                .desired_rows(5)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("{\"id\": 42}"),
+                        );
+                        ui.add_space(4.0);
+                        ui.weak("sent as {\"query\": ..., \"variables\": ...}");
+                    } else if self.cur.body_kind.is_text() || self.cur.body_kind == BodyKind::Form {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.cur.body)
                                 .code_editor()
@@ -2024,6 +2796,133 @@ fn extract_editor(
     }
     if rows.last().map(|r| !r.var.trim().is_empty()).unwrap_or(true) {
         rows.push(Extract::default());
+    }
+}
+
+/// The checks tab: rules on the left, the last run's verdict on the right.
+fn assert_editor(ui: &mut egui::Ui, rows: &mut Vec<Assertion>, results: &[assertion::Check]) {
+    let mut delete: Option<usize> = None;
+    // results line up with the active rules, in order
+    let mut verdicts = results.iter();
+
+    egui::Grid::new("assert_rules")
+        .num_columns(7)
+        .striped(true)
+        .spacing([6.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("");
+            ui.strong("check");
+            ui.strong("expression");
+            ui.strong("is");
+            ui.strong("expected");
+            ui.strong("last run");
+            ui.label("");
+            ui.end_row();
+
+            for (i, row) in rows.iter_mut().enumerate() {
+                let active = row.active();
+                ui.checkbox(&mut row.on, "");
+                egui::ComboBox::from_id_salt(("assert_on", i))
+                    .width(96.0)
+                    .selected_text(row.from.as_str())
+                    .show_ui(ui, |ui| {
+                        for f in AssertOn::ALL {
+                            ui.selectable_value(&mut row.from, f, f.as_str());
+                        }
+                    });
+                ui.add_enabled(
+                    row.from.needs_expr(),
+                    egui::TextEdit::singleline(&mut row.expr)
+                        .desired_width(200.0)
+                        .hint_text(row.from.hint()),
+                );
+                egui::ComboBox::from_id_salt(("assert_op", i))
+                    .width(120.0)
+                    .selected_text(row.op.as_str())
+                    .show_ui(ui, |ui| {
+                        for op in AssertOp::ALL {
+                            ui.selectable_value(&mut row.op, op, op.as_str());
+                        }
+                    });
+                ui.add_enabled(
+                    row.op.needs_value(),
+                    egui::TextEdit::singleline(&mut row.value)
+                        .desired_width(160.0)
+                        .hint_text("200"),
+                );
+
+                match if active { verdicts.next() } else { None } {
+                    Some(check) if check.passed => {
+                        ui.colored_label(
+                            Color32::from_rgb(0x4c, 0xaf, 0x50),
+                            format!("pass  -  {}", truncate(&check.detail, 36)),
+                        );
+                    }
+                    Some(check) => {
+                        ui.colored_label(
+                            Color32::from_rgb(0xef, 0x53, 0x50),
+                            format!("FAIL  -  {}", truncate(&check.detail, 36)),
+                        );
+                    }
+                    None => {
+                        ui.weak("-");
+                    }
+                }
+
+                if ui.small_button("x").clicked() {
+                    delete = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+
+    if let Some(i) = delete {
+        rows.remove(i);
+    }
+    ui.horizontal(|ui| {
+        if ui.button("+ check").clicked() {
+            rows.push(Assertion::default());
+        }
+        if ui
+            .button("+ status 200")
+            .on_hover_text("the check almost every request wants")
+            .clicked()
+        {
+            rows.push(Assertion::default());
+        }
+        if ui.button("+ under 1s").clicked() {
+            rows.push(Assertion {
+                from: AssertOn::ElapsedMs,
+                op: AssertOp::Lt,
+                value: "1000".to_owned(),
+                ..Default::default()
+            });
+        }
+    });
+    if !results.is_empty() {
+        let passed = results.iter().filter(|c| c.passed).count();
+        let all = passed == results.len();
+        ui.add_space(4.0);
+        ui.colored_label(
+            if all {
+                Color32::from_rgb(0x4c, 0xaf, 0x50)
+            } else {
+                Color32::from_rgb(0xef, 0x53, 0x50)
+            },
+            format!("{passed}/{} passed on the last send", results.len()),
+        );
+    }
+}
+
+/// "12s ago" / "4m ago" - enough to tell two sends apart in a list.
+fn ago(at: std::time::SystemTime) -> String {
+    let secs = at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
     }
 }
 
@@ -2752,6 +3651,9 @@ impl eframe::App for YapiApp {
         });
 
         self.curl_windows(&ctx);
+        self.env_editor_window(&ctx);
+        self.history_window(&ctx);
+        self.export_window(&ctx);
         self.autosave_draft(&ctx);
     }
 

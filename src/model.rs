@@ -52,6 +52,7 @@ impl Method {
 pub enum BodyKind {
     None,
     Json,
+    GraphQl,
     Xml,
     Text,
     Form,
@@ -60,9 +61,10 @@ pub enum BodyKind {
 }
 
 impl BodyKind {
-    pub const ALL: [BodyKind; 7] = [
+    pub const ALL: [BodyKind; 8] = [
         BodyKind::None,
         BodyKind::Json,
+        BodyKind::GraphQl,
         BodyKind::Xml,
         BodyKind::Text,
         BodyKind::Form,
@@ -74,6 +76,7 @@ impl BodyKind {
         match self {
             BodyKind::None => "none",
             BodyKind::Json => "json",
+            BodyKind::GraphQl => "graphql",
             BodyKind::Xml => "xml",
             BodyKind::Text => "raw",
             BodyKind::Form => "x-www-form-urlencoded",
@@ -86,7 +89,7 @@ impl BodyKind {
     pub fn content_type(self) -> Option<&'static str> {
         match self {
             BodyKind::None | BodyKind::Multipart | BodyKind::Binary => None,
-            BodyKind::Json => Some("application/json"),
+            BodyKind::Json | BodyKind::GraphQl => Some("application/json"),
             BodyKind::Xml => Some("application/xml"),
             BodyKind::Text => Some("text/plain; charset=utf-8"),
             BodyKind::Form => Some("application/x-www-form-urlencoded"),
@@ -97,6 +100,20 @@ impl BodyKind {
     pub fn is_text(self) -> bool {
         matches!(self, BodyKind::Json | BodyKind::Xml | BodyKind::Text)
     }
+}
+
+/// Wrap a graphql query and its variables into the `{query, variables}` body a
+/// graphql endpoint expects. Invalid variable json is passed through as `{}`
+/// rather than failing the send - the server's error is more useful than ours.
+pub fn graphql_body(query: &str, variables: &str) -> String {
+    let vars: serde_json::Value = match variables.trim() {
+        "" => serde_json::json!({}),
+        text => serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({})),
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert("query".to_owned(), serde_json::Value::String(query.to_owned()));
+    payload.insert("variables".to_owned(), vars);
+    serde_json::Value::Object(payload).to_string()
 }
 
 /// One row of a `form-data` body: either a text field or a file.
@@ -368,6 +385,53 @@ impl Default for Auth {
 }
 
 impl Auth {
+    /// A copy with every secret blanked, for a collection that leaves this
+    /// machine. Endpoints, client ids, header names and grant settings stay -
+    /// they are what makes the export worth sharing - but nothing that
+    /// authenticates as anyone survives.
+    pub fn scrubbed(&self) -> Auth {
+        Auth {
+            token: String::new(),
+            password: String::new(),
+            api_key_value: String::new(),
+            oauth: OAuth2 {
+                client_secret: String::new(),
+                password: String::new(),
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: 0,
+                ..self.oauth.clone()
+            },
+            jwt: JwtAuth {
+                token: String::new(),
+                secret: String::new(),
+                ..self.jwt.clone()
+            },
+            ..self.clone()
+        }
+    }
+
+    /// Names of the secret fields this auth actually has set, for warning
+    /// before an export drops them.
+    pub fn secrets_set(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut note = |set: bool, name: &'static str| {
+            if set {
+                out.push(name);
+            }
+        };
+        note(!self.token.trim().is_empty(), "bearer token");
+        note(!self.password.is_empty(), "password");
+        note(!self.api_key_value.trim().is_empty(), "api key");
+        note(!self.oauth.client_secret.trim().is_empty(), "oauth client secret");
+        note(!self.oauth.password.is_empty(), "oauth password");
+        note(!self.oauth.access_token.trim().is_empty(), "oauth token");
+        note(!self.oauth.refresh_token.trim().is_empty(), "oauth refresh token");
+        note(!self.jwt.token.trim().is_empty(), "jwt");
+        note(!self.jwt.secret.trim().is_empty(), "jwt signing secret");
+        out
+    }
+
     /// The header this auth adds, if any.
     pub fn header(&self) -> Option<(String, String)> {
         match self.kind {
@@ -593,6 +657,145 @@ impl Extract {
     }
 }
 
+/// Where an assertion reads the value it checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssertOn {
+    Status,
+    JsonPath,
+    Header,
+    Cookie,
+    Body,
+    ElapsedMs,
+}
+
+impl AssertOn {
+    pub const ALL: [AssertOn; 6] = [
+        AssertOn::Status,
+        AssertOn::JsonPath,
+        AssertOn::Header,
+        AssertOn::Cookie,
+        AssertOn::Body,
+        AssertOn::ElapsedMs,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AssertOn::Status => "status",
+            AssertOn::JsonPath => "jsonpath",
+            AssertOn::Header => "header",
+            AssertOn::Cookie => "cookie",
+            AssertOn::Body => "body",
+            AssertOn::ElapsedMs => "elapsed ms",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            AssertOn::Status => "(no expression)",
+            AssertOn::JsonPath => "$.data.id",
+            AssertOn::Header => "Content-Type",
+            AssertOn::Cookie => "session",
+            AssertOn::Body => "(no expression)",
+            AssertOn::ElapsedMs => "(no expression)",
+        }
+    }
+
+    pub fn needs_expr(self) -> bool {
+        matches!(self, AssertOn::JsonPath | AssertOn::Header | AssertOn::Cookie)
+    }
+}
+
+/// How an assertion compares what it found against what you expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssertOp {
+    Eq,
+    Ne,
+    Contains,
+    NotContains,
+    Matches,
+    Lt,
+    Gt,
+    Exists,
+    Missing,
+}
+
+impl AssertOp {
+    pub const ALL: [AssertOp; 9] = [
+        AssertOp::Eq,
+        AssertOp::Ne,
+        AssertOp::Contains,
+        AssertOp::NotContains,
+        AssertOp::Matches,
+        AssertOp::Lt,
+        AssertOp::Gt,
+        AssertOp::Exists,
+        AssertOp::Missing,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AssertOp::Eq => "==",
+            AssertOp::Ne => "!=",
+            AssertOp::Contains => "contains",
+            AssertOp::NotContains => "does not contain",
+            AssertOp::Matches => "matches",
+            AssertOp::Lt => "<",
+            AssertOp::Gt => ">",
+            AssertOp::Exists => "exists",
+            AssertOp::Missing => "is absent",
+        }
+    }
+
+    /// `exists` / `is absent` are about presence, so there is nothing to type.
+    pub fn needs_value(self) -> bool {
+        !matches!(self, AssertOp::Exists | AssertOp::Missing)
+    }
+}
+
+/// One "the response must look like this" check, run after every send.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Assertion {
+    pub on: bool,
+    pub from: AssertOn,
+    /// Path, header or cookie name; unused by `status`, `body` and `elapsed ms`.
+    pub expr: String,
+    pub op: AssertOp,
+    pub value: String,
+}
+
+impl Default for Assertion {
+    fn default() -> Self {
+        Self {
+            on: true,
+            from: AssertOn::Status,
+            expr: String::new(),
+            op: AssertOp::Eq,
+            value: "200".to_owned(),
+        }
+    }
+}
+
+impl Assertion {
+    pub fn active(&self) -> bool {
+        self.on && (!self.from.needs_expr() || !self.expr.trim().is_empty())
+    }
+
+    /// How this check reads in a log line.
+    pub fn label(&self) -> String {
+        let subject = if self.from.needs_expr() {
+            format!("{} {}", self.from.as_str(), self.expr.trim())
+        } else {
+            self.from.as_str().to_owned()
+        };
+        if self.op.needs_value() {
+            format!("{subject} {} {}", self.op.as_str(), self.value.trim())
+        } else {
+            format!("{subject} {}", self.op.as_str())
+        }
+    }
+}
+
 /// An ordered run of saved requests, with values flowing between them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -676,6 +879,8 @@ pub struct RequestSpec {
     pub cookies: Vec<KeyVal>,
     pub body_kind: BodyKind,
     pub body: String,
+    /// Variables json for a `graphql` body; ignored by every other kind.
+    pub graphql_vars: String,
     pub form_parts: Vec<FormPart>,
     /// File sent as the whole body when `body_kind` is `Binary`.
     pub binary_path: String,
@@ -683,7 +888,11 @@ pub struct RequestSpec {
     pub auth: Auth,
     /// Values pulled out of this request's response, for later requests.
     pub extract: Vec<Extract>,
+    /// Checks run against this request's response after every send.
+    pub assertions: Vec<Assertion>,
     pub transport: Transport,
+    /// Folder this request is filed under; empty means the top level.
+    pub folder: String,
 }
 
 impl Default for RequestSpec {
@@ -698,12 +907,15 @@ impl Default for RequestSpec {
             cookies: vec![KeyVal::default()],
             body_kind: BodyKind::None,
             body: String::new(),
+            graphql_vars: String::new(),
             form_parts: vec![FormPart::default()],
             binary_path: String::new(),
             binary_content_type: String::new(),
             auth: Auth::default(),
             extract: vec![Extract::default()],
+            assertions: Vec::new(),
             transport: Transport::default(),
+            folder: String::new(),
         }
     }
 }
@@ -767,6 +979,7 @@ impl RequestSpec {
             cookies: sub_rows(&self.cookies),
             body_kind: self.body_kind,
             body: sub(&self.body),
+            graphql_vars: sub(&self.graphql_vars),
             form_parts: self
                 .form_parts
                 .iter()
@@ -782,10 +995,21 @@ impl RequestSpec {
             binary_content_type: self.binary_content_type.clone(),
             auth,
             extract: self.extract.clone(),
+            // an expected value can itself be a {{variable}}
+            assertions: self
+                .assertions
+                .iter()
+                .map(|a| Assertion {
+                    expr: substitute(&a.expr, vars),
+                    value: substitute(&a.value, vars),
+                    ..a.clone()
+                })
+                .collect(),
             transport: Transport {
                 proxy: sub(&self.transport.proxy),
                 ..self.transport.clone()
             },
+            folder: self.folder.clone(),
         }
     }
 
@@ -875,7 +1099,134 @@ pub struct Collection {
     pub requests: Vec<RequestSpec>,
     pub chains: Vec<Chain>,
     /// Starting values for `{{name}}` substitution, before anything is extracted.
+    ///
+    /// Kept for collections written before environments existed, and still the
+    /// base every environment layers on top of.
     pub variables: Vec<KeyVal>,
+    /// Named variable sets - dev, staging, prod. The active one is layered over
+    /// `variables`, so a name only has to appear here when it differs.
+    pub environments: Vec<Environment>,
+    /// Index into `environments`; `None` means base variables only.
+    pub active_env: Option<usize>,
+    /// Folder names requests can be filed under. A request names its folder
+    /// rather than living inside it, so renaming a folder is one edit and a
+    /// request can always be moved without touching its contents.
+    pub folders: Vec<String>,
+}
+
+/// One named set of `{{variable}}` values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Environment {
+    pub name: String,
+    pub vars: Vec<KeyVal>,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self {
+            name: "new environment".to_owned(),
+            vars: Vec::new(),
+        }
+    }
+}
+
+impl Collection {
+    /// Base variables with the active environment layered on top. This is the
+    /// starting point every send resolves against, before extraction.
+    pub fn resolved_vars(&self) -> BTreeMap<String, String> {
+        let mut out: BTreeMap<String, String> = self
+            .variables
+            .iter()
+            .filter(|v| v.active())
+            .map(|v| (v.key.trim().to_owned(), v.value.clone()))
+            .collect();
+        if let Some(env) = self.active_env.and_then(|i| self.environments.get(i)) {
+            for v in env.vars.iter().filter(|v| v.active()) {
+                out.insert(v.key.trim().to_owned(), v.value.clone());
+            }
+        }
+        out
+    }
+
+    pub fn active_env_name(&self) -> &str {
+        self.active_env
+            .and_then(|i| self.environments.get(i))
+            .map(|e| e.name.as_str())
+            .unwrap_or("no environment")
+    }
+
+    /// Folder names actually in use, plus any declared but empty, sorted. The
+    /// empty string (top level) is never in here.
+    pub fn folder_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.folders.clone();
+        for r in &self.requests {
+            let f = r.folder.trim();
+            if !f.is_empty() && !out.iter().any(|x| x == f) {
+                out.push(f.to_owned());
+            }
+        }
+        out.retain(|f| !f.trim().is_empty());
+        out.sort_by_key(|f| f.to_lowercase());
+        out.dedup();
+        out
+    }
+
+    /// A copy safe to hand to someone else: every credential blanked. Variable
+    /// values go too, since a `{{token}}` default is a secret by another name.
+    pub fn scrubbed(&self) -> Collection {
+        let blank = |rows: &Vec<KeyVal>| -> Vec<KeyVal> {
+            rows.iter()
+                .map(|v| KeyVal {
+                    value: String::new(),
+                    ..v.clone()
+                })
+                .collect()
+        };
+        Collection {
+            requests: self
+                .requests
+                .iter()
+                .map(|r| RequestSpec {
+                    auth: r.auth.scrubbed(),
+                    ..r.clone()
+                })
+                .collect(),
+            chains: self.chains.clone(),
+            variables: blank(&self.variables),
+            environments: self
+                .environments
+                .iter()
+                .map(|e| Environment {
+                    name: e.name.clone(),
+                    vars: blank(&e.vars),
+                })
+                .collect(),
+            active_env: self.active_env,
+            folders: self.folders.clone(),
+        }
+    }
+
+    /// What `scrubbed` would strip, described for a confirmation prompt.
+    pub fn secrets_summary(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in &self.requests {
+            let found = r.auth.secrets_set();
+            if !found.is_empty() {
+                out.push(format!("{}: {}", r.name, found.join(", ")));
+            }
+        }
+        let vars = self
+            .variables
+            .iter()
+            .chain(self.environments.iter().flat_map(|e| e.vars.iter()))
+            .filter(|v| v.active() && !v.value.is_empty())
+            .count();
+        if vars > 0 {
+            out.push(format!("{vars} variable value(s)"));
+        }
+        out
+    }
 }
 
 /// `:name` and `{name}` placeholders found in a url, in order, deduplicated.
@@ -1478,5 +1829,54 @@ mod tests {
         };
         let missing = spec.missing_vars(&vars());
         assert_eq!(missing, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_graphql_body_wraps_the_query_and_its_variables() {
+        let body = graphql_body("query Me { viewer { id } }", r#"{"id": 7}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["query"], "query Me { viewer { id } }");
+        assert_eq!(parsed["variables"]["id"], 7);
+    }
+
+    #[test]
+    fn graphql_variables_that_are_not_json_become_an_empty_object() {
+        // the server's own error about the query beats one invented here
+        for bad in ["", "   ", "not json", "{unclosed"] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&graphql_body("{ me }", bad)).unwrap();
+            assert_eq!(parsed["variables"], serde_json::json!({}), "{bad:?}");
+            assert_eq!(parsed["query"], "{ me }");
+        }
+    }
+
+    #[test]
+    fn a_graphql_query_can_carry_variables_of_its_own() {
+        let spec = RequestSpec {
+            body_kind: BodyKind::GraphQl,
+            body: "query { user(id: {{user_id}}) { name } }".into(),
+            graphql_vars: r#"{"id": "{{user_id}}"}"#.into(),
+            ..Default::default()
+        };
+        let vars = BTreeMap::from([("user_id".to_owned(), "42".to_owned())]);
+        let resolved = spec.resolve(&vars);
+        assert!(resolved.body.contains("user(id: 42)"));
+        assert_eq!(resolved.graphql_vars, r#"{"id": "42"}"#);
+    }
+
+    #[test]
+    fn folder_names_come_from_the_requests_as_well_as_the_list() {
+        let coll = Collection {
+            requests: vec![
+                RequestSpec { folder: "admin".into(), ..Default::default() },
+                RequestSpec { folder: "  ".into(), ..Default::default() },
+                RequestSpec { folder: "Billing".into(), ..Default::default() },
+            ],
+            // declared but with nothing in it yet
+            folders: vec!["admin".into(), "empty".into()],
+            ..Default::default()
+        };
+        // case-insensitive sort, no duplicates, no blank entry
+        assert_eq!(coll.folder_names(), vec!["admin", "Billing", "empty"]);
     }
 }

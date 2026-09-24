@@ -22,6 +22,10 @@ pub enum ChainMsg {
         extracted: Vec<(String, String)>,
         /// Rules that could not be applied.
         warnings: Vec<String>,
+        /// Assertions on this step: passed, total. `None` when it had none.
+        checks: Option<(usize, usize)>,
+        /// The checks that failed, named.
+        failed_checks: Vec<String>,
     },
     Failed {
         index: usize,
@@ -84,7 +88,21 @@ pub fn spawn_run(
                     for (k, v) in &out.values {
                         vars.insert(k.clone(), v.clone());
                     }
-                    let failed_status = resp.status >= 400;
+                    // a step whose checks fail stops the chain the same way a
+                    // 5xx does - that is what makes a chain a test
+                    let checked = crate::assertion::apply(&resolved.assertions, &resp);
+                    let failed_checks: Vec<String> = checked
+                        .results
+                        .iter()
+                        .filter(|c| !c.passed)
+                        .map(|c| format!("{} ({})", c.label, c.detail))
+                        .collect();
+                    let checks = if checked.results.is_empty() {
+                        None
+                    } else {
+                        Some((checked.passed(), checked.results.len()))
+                    };
+                    let failed_status = resp.status >= 400 || !failed_checks.is_empty();
                     let _ = tx.send(ChainMsg::Done {
                         index,
                         name,
@@ -92,6 +110,8 @@ pub fn spawn_run(
                         elapsed_ms: resp.elapsed_ms,
                         extracted: out.values,
                         warnings: out.errors,
+                        checks,
+                        failed_checks,
                     });
                     if failed_status {
                         ok = false;
@@ -213,6 +233,121 @@ mod tests {
             }
         }
         (log, ok, ran)
+    }
+
+    #[test]
+    fn a_failing_check_stops_the_chain_even_on_a_200() {
+        // both steps answer 200; the first one's assertion is what should stop it
+        let (port, _server) = scripted(vec![r#"{"id":1,"state":"pending"}"#]);
+
+        let first = RequestSpec {
+            name: "create".into(),
+            method: Method::Post,
+            url: format!("localhost:{port}/things"),
+            params: vec![],
+            headers: vec![],
+            assertions: vec![crate::model::Assertion {
+                on: true,
+                from: crate::model::AssertOn::JsonPath,
+                expr: "$.state".into(),
+                op: crate::model::AssertOp::Eq,
+                value: "ready".into(),
+            }],
+            ..Default::default()
+        };
+        let second = RequestSpec {
+            name: "follow up".into(),
+            url: format!("localhost:{port}/things/1"),
+            params: vec![],
+            headers: vec![],
+            ..Default::default()
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_run(
+            vec![step(first), step(second)],
+            BTreeMap::new(),
+            SendOpts {
+                timeout_secs: 5,
+                insecure_tls: false,
+            },
+            tx,
+            egui::Context::default(),
+        );
+
+        let mut checks = None;
+        let mut failed = Vec::new();
+        let mut ran = 0;
+        let mut ok = true;
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                ChainMsg::Done {
+                    checks: c,
+                    failed_checks,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(status, 200, "the server did answer");
+                    checks = c;
+                    failed = failed_checks;
+                }
+                ChainMsg::Finished { ran: r, ok: o } => {
+                    ran = r;
+                    ok = o;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(checks, Some((0, 1)));
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains("state"), "{failed:?}");
+        assert!(failed[0].contains("pending"), "{failed:?}");
+        // the second step never went out
+        assert_eq!(ran, 1);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn passing_checks_leave_the_chain_alone() {
+        let (port, _server) = scripted(vec![r#"{"state":"ready"}"#, r#"{"done":true}"#]);
+        let first = RequestSpec {
+            name: "create".into(),
+            url: format!("localhost:{port}/things"),
+            params: vec![],
+            headers: vec![],
+            assertions: vec![crate::model::Assertion {
+                on: true,
+                from: crate::model::AssertOn::JsonPath,
+                expr: "$.state".into(),
+                op: crate::model::AssertOp::Eq,
+                value: "ready".into(),
+            }],
+            ..Default::default()
+        };
+        let second = RequestSpec {
+            name: "follow up".into(),
+            url: format!("localhost:{port}/things/1"),
+            params: vec![],
+            headers: vec![],
+            ..Default::default()
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_run(
+            vec![step(first), step(second)],
+            BTreeMap::new(),
+            SendOpts {
+                timeout_secs: 5,
+                insecure_tls: false,
+            },
+            tx,
+            egui::Context::default(),
+        );
+        let (_log, ok, ran) = collect(rx);
+        assert!(ok);
+        assert_eq!(ran, 2);
     }
 
     #[test]

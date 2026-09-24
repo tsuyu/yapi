@@ -41,7 +41,7 @@ impl Shape {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResponseData {
     pub status: u16,
     pub status_text: String,
@@ -135,16 +135,35 @@ pub fn detect_shape(content_type: &str, bytes: &[u8]) -> Shape {
 }
 
 pub enum Msg {
-    Done(Box<ResponseData>),
-    Failed(String),
+    /// `seq` identifies which send this answers, so a result the user has
+    /// already cancelled can be recognised and dropped.
+    Done { seq: u64, resp: Box<ResponseData> },
+    Failed { seq: u64, error: String },
 }
 
-/// Fire the request on a worker thread; result arrives on `tx`.
-pub fn spawn(spec: RequestSpec, opts: SendOpts, tx: Sender<Msg>, ctx: egui::Context) {
+impl Msg {
+    pub fn seq(&self) -> u64 {
+        match self {
+            Msg::Done { seq, .. } | Msg::Failed { seq, .. } => *seq,
+        }
+    }
+}
+
+/// Fire the request on a worker thread; result arrives on `tx` tagged with
+/// `seq`.
+///
+/// Cancelling is a UI-side matter: the caller stops waiting and ignores any
+/// result carrying an old `seq`. The blocking reqwest call underneath has no
+/// abort, so the socket stays open until it finishes or the timeout fires —
+/// what cancel buys you is an unstuck UI, not a closed connection.
+pub fn spawn(spec: RequestSpec, opts: SendOpts, seq: u64, tx: Sender<Msg>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let msg = match run(spec, opts) {
-            Ok(r) => Msg::Done(Box::new(r)),
-            Err(e) => Msg::Failed(e),
+            Ok(r) => Msg::Done {
+                seq,
+                resp: Box::new(r),
+            },
+            Err(e) => Msg::Failed { seq, error: e },
         };
         let _ = tx.send(msg);
         ctx.request_repaint();
@@ -201,6 +220,9 @@ fn run(spec: RequestSpec, opts: SendOpts) -> Result<ResponseData, String> {
         BodyKind::None => {}
         BodyKind::Json | BodyKind::Xml | BodyKind::Text => {
             req = req.body(spec.body.clone());
+        }
+        BodyKind::GraphQl => {
+            req = req.body(crate::model::graphql_body(&spec.body, &spec.graphql_vars));
         }
         BodyKind::Form => {
             let pairs = crate::model::parse_query(&spec.body.replace(['\n', '\r'], "&"));
