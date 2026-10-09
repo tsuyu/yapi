@@ -1432,6 +1432,29 @@ pub fn parse_query(query: &str) -> Vec<KeyVal> {
         .collect()
 }
 
+/// Encode a `x-www-form-urlencoded` body from the editor's raw `key=value`
+/// lines.
+///
+/// The lines are raw text, not an already-encoded query string, so values are
+/// taken verbatim and percent-encoded exactly once. Decoding first - as a query
+/// parser would - reads a literal `+` in a value (base64 is full of them) as a
+/// space and corrupts the body, which the server then rejects.
+pub fn form_body(raw: &str) -> String {
+    let pairs: Vec<KeyVal> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let (k, v) = line.split_once('=').unwrap_or((line, ""));
+            KeyVal {
+                on: true,
+                key: k.trim().to_owned(),
+                value: v.to_owned(),
+            }
+        })
+        .collect();
+    urlencode_pairs(&pairs)
+}
+
 /// `key=value` pairs joined with `&`, for form bodies.
 pub fn urlencode_pairs(pairs: &[KeyVal]) -> String {
     pairs
@@ -1543,6 +1566,21 @@ mod tests {
     fn form_body_encodes_pairs() {
         let pairs = parse_query("user=me&pw=p%40ss");
         assert_eq!(urlencode_pairs(&pairs), "user=me&pw=p%40ss");
+    }
+
+    #[test]
+    fn form_body_percent_encodes_raw_lines() {
+        // one key=value per line, values taken verbatim
+        let body = "user=me\npw=p@ss";
+        assert_eq!(form_body(body), "user=me&pw=p%40ss");
+    }
+
+    #[test]
+    fn form_body_keeps_base64_plus_as_percent_2b() {
+        // a literal `+` in a base64 value must go out as %2B, not `+` (which the
+        // server would read back as a space and corrupt the payload)
+        let body = "img=ab+/c=\nx=1";
+        assert_eq!(form_body(body), "img=ab%2B%2Fc%3D&x=1");
     }
 
     #[test]

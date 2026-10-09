@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use crate::model::{is_loopback, urlencode_pairs, BodyKind, RequestSpec};
+use crate::model::{is_loopback, BodyKind, RequestSpec};
 use reqwest::blocking::multipart;
 
 #[derive(Debug, Clone, Copy)]
@@ -225,8 +225,7 @@ fn run(spec: RequestSpec, opts: SendOpts) -> Result<ResponseData, String> {
             req = req.body(crate::model::graphql_body(&spec.body, &spec.graphql_vars));
         }
         BodyKind::Form => {
-            let pairs = crate::model::parse_query(&spec.body.replace(['\n', '\r'], "&"));
-            req = req.body(urlencode_pairs(&pairs));
+            req = req.body(crate::model::form_body(&spec.body));
         }
         BodyKind::Multipart => {
             // reqwest sets Content-Type itself here - it carries the boundary
