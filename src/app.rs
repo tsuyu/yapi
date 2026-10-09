@@ -940,10 +940,14 @@ impl YapiApp {
         let mut delete: Option<usize> = None;
         let mut open: Option<usize> = None;
         let mut toggle_folder: Option<String> = None;
-        let list_height = (ui.available_height() - 64.0).max(80.0);
+        let mut delete_folder: Option<String> = None;
+        // footer pinned to the bottom so the env picker, variables and the
+        // import/export row stay visible however long the request list grows -
+        // the list then scrolls inside whatever height is left
+        egui::Panel::bottom("sidebar_footer").show(ui, |ui| self.sidebar_footer(ui));
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .max_height(list_height)
             .show(ui, |ui| {
                 let requests = &self.coll.requests;
                 let selected = self.selected;
@@ -970,12 +974,23 @@ impl YapiApp {
                 for (name, members) in &groups {
                     let collapsed = self.collapsed_folders.iter().any(|f| f == name);
                     let arrow = if collapsed { ">" } else { "v" };
-                    if ui
-                        .small_button(format!("{arrow}  {name}  ({})", members.len()))
-                        .clicked()
-                    {
-                        toggle_folder = Some(name.clone());
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button(format!("{arrow}  {name}  ({})", members.len()))
+                            .clicked()
+                        {
+                            toggle_folder = Some(name.clone());
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("x")
+                                .on_hover_text("delete folder - its requests move to no folder")
+                                .clicked()
+                            {
+                                delete_folder = Some(name.clone());
+                            }
+                        });
+                    });
                     if !collapsed {
                         for i in members {
                             row(ui, *i, 12.0);
@@ -1001,6 +1016,22 @@ impl YapiApp {
             self.cur = self.coll.requests[i].clone();
             self.assert_results.clear();
         }
+        if let Some(name) = delete_folder {
+            // drop the folder but keep its requests - they fall back to the top
+            // level rather than being deleted with it
+            for r in &mut self.coll.requests {
+                if r.folder.trim() == name {
+                    r.folder.clear();
+                }
+            }
+            self.coll.folders.retain(|f| f.trim() != name);
+            self.collapsed_folders.retain(|f| f != &name);
+            if self.cur.folder.trim() == name {
+                self.cur.folder.clear();
+            }
+            self.persist();
+            self.toast = format!("deleted folder \"{name}\" - its requests moved to no folder");
+        }
         if let Some(name) = toggle_folder {
             match self.collapsed_folders.iter().position(|f| f == &name) {
                 Some(at) => {
@@ -1019,7 +1050,14 @@ impl YapiApp {
             };
             self.persist();
         }
+    }
 
+    /// The sidebar footer: environment picker, variables, and the
+    /// import/export row. Lives in a bottom panel so it is never pushed off
+    /// screen by a long request list.
+    fn sidebar_footer(&mut self, ui: &mut egui::Ui) {
+        self.environment_bar(ui);
+        self.variables_panel(ui);
         ui.separator();
         ui.horizontal(|ui| {
             if ui.button("import").clicked() {
@@ -1052,9 +1090,6 @@ impl YapiApp {
             }
         });
         ui.weak(RichText::new(self.path.display().to_string()).size(9.0));
-        ui.separator();
-        self.environment_bar(ui);
-        self.variables_panel(ui);
     }
 
     fn write_export(&mut self, path: &std::path::Path, scrubbed: bool) {
@@ -1697,6 +1732,10 @@ impl YapiApp {
             let folders = self.coll.folder_names();
             egui::ComboBox::from_id_salt("folder_pick")
                 .width(130.0)
+                // the popup holds a "new folder" text field; the default
+                // close-on-click would shut the popup the moment you click into
+                // it, so only close on a click outside the popup body
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .selected_text(if self.cur.folder.trim().is_empty() {
                     "no folder".to_owned()
                 } else {
